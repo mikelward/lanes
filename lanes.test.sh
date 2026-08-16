@@ -340,6 +340,39 @@ cp "$stub/hostile.conf" "$stub/outside/lanes.conf"
   check "a policy path outside the repo refuses"   1 "outside the repository" FILES="README.md" LANES_CONFIG="../outside/lanes.conf"
 ) || fails=1
 
+# --- every `**/` varies independently, not just the first
+# `a/**/b/**/c.md` against `a/x/b/c.md` needs the FIRST kept and the SECOND
+# dropped -- a combination a single-drop recursion never forms, so the
+# all-zero and all-nonzero cases passed while the mixed one did not.
+cat > "$stub/multi.conf" <<'EOF'
+docs a/**/b/**/c.md
+prefixes docs
+EOF
+check "both ** taken as zero"                0 "docs_only=true"  FILES="a/b/c.md" LANES_CONFIG="$stub/multi.conf"
+check "both ** taken as segments"            0 "docs_only=true"  FILES="a/x/b/y/c.md" LANES_CONFIG="$stub/multi.conf"
+check "first kept, second dropped"           0 "docs_only=true"  FILES="a/x/b/c.md" LANES_CONFIG="$stub/multi.conf"
+check "first dropped, second kept"           0 "docs_only=true"  FILES="a/b/y/c.md" LANES_CONFIG="$stub/multi.conf"
+check "and a genuine non-match still fails"  0 "docs_only=false" FILES="a/x/z/c.md" LANES_CONFIG="$stub/multi.conf"
+
+# The expansion doubles per `**`, so the count is bounded at parse time
+# rather than left to degrade at match time.
+cat > "$stub/starry.conf" <<'EOF'
+docs a/**/b/**/c/**/d/**/e/**/f.md
+prefixes docs
+EOF
+check "too many wildcards is refused"        1 "too many wildcards" FILES="README.md" LANES_CONFIG="$stub/starry.conf"
+
+# --- an absolute config path inside the checkout is normalized, not recorded
+# The API reports edits relatively, so recording the absolute spelling gives
+# a guard that can never match. Outside the checkout there is nothing to
+# guard, since no pull request can edit a file the repository does not hold.
+mkdir -p "$stub/abs/.github"
+cp "$stub/hostile.conf" "$stub/abs/.github/lanes.conf"
+( cd "$stub/abs" || exit 1
+  check "an in-repo absolute path still guards" 0 "docs_only=false" FILES=".github/lanes.conf" LANES_CONFIG="$PWD/.github/lanes.conf"
+  check "and an unrelated file still rides"     0 "docs_only=true"  FILES="README.md" LANES_CONFIG="$PWD/.github/lanes.conf"
+) || fails=1
+
 # --- classify: the rule itself, both directions per shape
 check "markdown-only diff is docs"        0 "docs_only=true"  FILES="README.md docs/DESIGN.md"
 check "code file makes it code"           0 "docs_only=false" FILES="README.md crates/app/src/main.rs"

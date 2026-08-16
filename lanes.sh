@@ -73,7 +73,7 @@ LANE_PREFIXES=''
 DISPATCH_WITHOUT_PR=refuse
 
 parse_policy() {
-  local line directive rest lineno=0
+  local line directive rest lineno=0 stars
   while IFS= read -r line || [ -n "$line" ]; do
     lineno=$((lineno + 1))
     # Trailing comment, then surrounding whitespace.
@@ -91,6 +91,14 @@ parse_policy() {
       docs|code)
         if [ -z "$rest" ]; then
           echo "::error::${LANES_CONFIG}:${lineno}: '${directive}' needs a pattern." >&2
+          return 1
+        fi
+        # Each `**/` doubles the variants matching has to try, so the count is
+        # bounded here rather than left to degrade silently at match time. Four
+        # is far past any real rule and keeps the expansion at sixteen.
+        stars=${rest//[!*]/}
+        if [ "${#stars}" -gt 8 ]; then
+          echo "::error::${LANES_CONFIG}:${lineno}: too many wildcards in '${rest}' — at most four '**' segments." >&2
           return 1
         fi
         RULES="${RULES}${directive}	${rest}
@@ -159,30 +167,52 @@ slashes() {
 #
 # `**` opts out of the depth check and falls through to `case`, where it
 # behaves as an ordinary crossing wildcard.
-matches_pattern() {
-  local path=$1 pattern=$2
-  # `**/` means zero OR MORE segments, and the zero case needs its own try:
-  # as a bare case pattern `**/*.md` still requires a literal `/`, so it would
-  # miss README.md -- the root file the rule most obviously ought to cover.
-  # Each recursion drops one `**/`, so this terminates.
+# Every pattern obtained by independently taking each `**/` as zero segments
+# (dropped) or one-or-more (kept), one per line.
+#
+# `**/` means zero OR MORE, and as a bare case pattern it can only express
+# one-or-more: `a/**/b` requires something between the slashes. So the zero
+# case needs a variant with that `**/` removed -- and EVERY `**/` needs its
+# own, independently. Dropping only the first, as this did, cannot match
+# `a/x/b/c.md` against `a/**/b/**/c.md`: that needs the first kept and the
+# second dropped, a combination the single-drop recursion never forms.
+#
+# Split around the first occurrence rather than using ${var/pat/rep}: there
+# the unquoted `/` inside the pattern would terminate it, and a glob `**/`
+# would match far more than the literal three characters.
+pattern_variants() {
+  local pattern=$1 head tail sub
   case "$pattern" in
     *'**/'*)
-      # Split around the first `**/` rather than using ${var/pat/rep}: there
-      # the unquoted `/` inside the pattern would terminate it, and a glob
-      # `**/` would match far more than the literal three characters.
-      matches_pattern "$path" "${pattern%%'**/'*}${pattern#*'**/'}" && return 0
+      head=${pattern%%'**/'*}
+      tail=${pattern#*'**/'}
+      # This one taken as zero segments.
+      pattern_variants "$head$tail"
+      # This one kept, with everything after it still varying.
+      while IFS= read -r sub; do
+        test -n "$sub" || continue
+        printf '%s\n' "${head}**/${sub}"
+      done <<< "$(pattern_variants "$tail")"
       ;;
+    *) printf '%s\n' "$pattern" ;;
   esac
-  case "$pattern" in
-    *'**'*) ;;
-    *) test "$(slashes "$path")" = "$(slashes "$pattern")" || return 1 ;;
-  esac
-  # Unquoted on purpose: this is glob matching. The value is not re-scanned
-  # for expansions, so a rule holding $(...) is text, not a command.
-  # shellcheck disable=SC2254
-  case "$path" in
-    $pattern) return 0 ;;
-  esac
+}
+
+matches_pattern() {
+  local path=$1 pattern=$2 variant
+  while IFS= read -r variant; do
+    test -n "$variant" || continue
+    case "$variant" in
+      *'**'*) ;;
+      *) test "$(slashes "$path")" = "$(slashes "$variant")" || continue ;;
+    esac
+    # Unquoted on purpose: this is glob matching. The value is not re-scanned
+    # for expansions, so a rule holding $(...) is text, not a command.
+    # shellcheck disable=SC2254
+    case "$path" in
+      $variant) return 0 ;;
+    esac
+  done <<< "$(pattern_variants "$pattern")"
   return 1
 }
 
@@ -246,12 +276,29 @@ count_lines() {
 # a pull request's file list, so guarding it would only add noise.
 policy_paths() {
   local remaining=${LANES_CONFIG#./} prefix='' comp rest target rebased steps=0
-  # An absolute path is not a repository path, so no API-reported filename
-  # can ever equal one and there is nothing under it to walk. Record it and
-  # stop: still guarded if a caller compares against the same spelling, and
-  # no pretence of resolving a tree the diff cannot describe.
+  # An absolute path splits two ways, and the previous version treated both
+  # as the second.
+  #
+  # INSIDE the checkout it names a real repository file that a pull request
+  # can edit -- and the API reports that edit relatively, so recording the
+  # absolute spelling produces a guard that can never match. It is rewritten
+  # to its repo-relative form and walked normally.
+  #
+  # OUTSIDE the checkout there is genuinely nothing to guard: no pull request
+  # can edit a file that is not in the repository, so no changed path can
+  # ever need to match. Recorded and left alone.
   case "$remaining" in
-    /*) printf '%s\n' "$remaining"; return 0 ;;
+    /*)
+      if rebased=$(realpath -m -s --relative-to="$PWD" "$remaining" 2>&1); then
+        case "$rebased" in
+          ../*|/*) printf '%s\n' "$remaining"; return 0 ;;
+          *) printf '%s\n' "$remaining"; remaining=$rebased ;;
+        esac
+      else
+        echo "::error::Could not place the policy path '${LANES_CONFIG}' relative to the checkout: ${rebased}" >&2
+        return 1
+      fi
+      ;;
   esac
   # The configured spelling, recorded as written. Git tracks a file at its
   # real path, so a path THROUGH a symlinked directory should never appear in
