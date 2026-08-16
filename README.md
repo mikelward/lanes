@@ -35,28 +35,35 @@ Two jobs, plus a policy file.
 
 ### 1. The policy — `.github/lanes.conf`
 
-```bash
-# Which paths cannot change what the heavy jobs validate.
-# Ordered: the first arm that matches wins.
-is_docs() {
-  case "$1" in
-    docs/REFERENCE.md) return 1 ;;  # compiled in; see the trap below
-    *.md) return 0 ;;
-    *) return 1 ;;                  # everything else is code
-  esac
-}
+```
+# Ordered: the FIRST matching rule wins, and anything matching no rule is code.
+code docs/REFERENCE.md    # compiled in by a test; see the trap below
+docs *.md
+docs docs/*.md
 
-# The commit-subject prefixes this repository's conventions give
-# docs-lane commits. On the docs lane every commit must carry
-# one, so nothing on that lane reads like a behavior change.
-LANE_PREFIXES="design docs todo test build refactor"
+# Commit-subject prefixes the docs lane accepts. On that lane every commit
+# must carry one, so nothing riding it reads like a behavior change.
+prefixes design docs todo test build refactor
+
+# Optional; defaults to refuse.
+dispatch-without-pr refuse
 ```
 
-Optionally, if a dispatched run with no pull request is legitimate here:
+**`*` never crosses `/`.** That is gitignore's rule, and it is the one thing
+here most likely to be assumed wrongly, because a bare shell `case` behaves
+the other way:
 
-```bash
-dispatch_without_pr_ok() { return 0; }
-```
+| pattern | matches |
+|---|---|
+| `*.md` | `README.md` — **not** `docs/DESIGN.md` |
+| `docs/*.md` | `docs/DESIGN.md` — **not** `docs/a/B.md` |
+| `**/*.md` | markdown at any depth |
+| `docs/**` | everything under `docs/` |
+
+Full-line comments start with `#`; a trailing comment starts at
+whitespace-then-`#`, so a pattern cannot contain `" #"`. An unknown directive
+is an error rather than a skipped line — a typo silently ignored is a policy
+that quietly does less than it says.
 
 ### 2. The jobs
 
@@ -108,7 +115,7 @@ never reports on the docs lane, so nothing merges.
 `permissions: contents: read` and `pull-requests: read` are enough; the engine
 writes nothing.
 
-## Why the policy is a file, not inputs
+## Why the policy is data, and a file
 
 Both modes evaluate the policy. The gate's whole value is re-deriving the
 classification *independently, under the same rules* — it distrusts
@@ -119,13 +126,24 @@ reporting green on validation it did not perform.
 
 A file is one copy by construction.
 
-**The policy is never sourced into the engine's shell.** A sourced file *is*
-the shell, not a set of definitions: it would control the positional
-parameters, the environment the engine reads afterwards, `PATH`, and even a
-`gh()` function shadowing every API call the classification rests on. There
-is no list of those to defend, so isolation is structural — every question is
-put to a child process that shares nothing back but an exit status or one
-line of output.
+**The policy never executes.** It is parsed as data, and that is the whole of
+the trust story.
+
+It began as a sourced shell file, which took four review rounds to establish
+was indefensible. On a `pull_request` event the checkout is the merge ref, so
+the file is the *pull request's* copy — and a sourced file **is** the shell.
+It controlled the positional parameters (a config holding `set -- classify`
+made `lanes.sh gate` run the classify arm and exit 0 without ever reading its
+inputs — the required check green over failed jobs), the environment read
+afterwards, `PATH`, and a `gh()` function shadowing every API call the
+classification rests on. Isolating it in a subshell fixed the reach into
+engine state and none of the rest, since a subshell still inherits the token,
+the network and a writable disk.
+
+Each of those was a different name for one mistake: letting it run at all.
+Patterns are matched with `case`, which expands a pattern word once and does
+not re-scan a variable's value — so `$(...)` inside a rule is inert text. The
+suite asserts that by planting one and checking nothing happened.
 
 **And the engine, not the policy, decides that the policy file is code.** On a
 `pull_request` event the checkout is the pull request's merge ref, so the
@@ -146,13 +164,9 @@ missing file, one defining no `is_docs`, or one with an empty
 
 Start with markdown, and keep it boring:
 
-```bash
-is_docs() {
-  case "$1" in
-    *.md) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+```
+docs *.md
+prefixes docs test build
 ```
 
 The direction to move in is **narrower, not wider** — ideally only markdown
@@ -184,8 +198,8 @@ test that exists to catch editing it wrong.
 **Do not solve this with a hand-maintained exclusion list.** It drifts exactly
 like the prose did, and it drifts silently. Derive it: have a test that scans
 your source for embedding constructs, resolves each referenced path, and
-asserts that anything documentation-shaped among them is classified as code by
-your own `is_docs`. Then the day someone embeds a new file, CI says so
+asserts that anything documentation-shaped among them is matched by a `code`
+rule in your policy. Then the day someone embeds a new file, CI says so
 — which is the only moment anybody has the knowledge.
 
 That test belongs in the consumer, not here: which constructs embed files is a

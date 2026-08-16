@@ -16,30 +16,50 @@
 # the docs rule cannot drift between them. What the gate adds is
 # re-execution plus a cross-check against what actually ran.
 set -euo pipefail
+# IFS is deliberately left at its default. Narrowing it to newline+tab is the
+# usual hardening, and here it is actively wrong: every `read` below sets IFS
+# for itself, and the two unquoted expansions that remain -- the prefix list
+# and the heavy-job results -- are space-separated by design, so removing
+# space from IFS stops them splitting at all. The suite caught that.
 
-# --- Consumer config -------------------------------------------------------
+# --- Consumer policy -------------------------------------------------------
 #
-# A file rather than action inputs, and that is the load-bearing choice here.
-# Both modes evaluate the policy, and the gate's whole value is re-deriving
-# the classification independently *under the same rules*. Policy supplied at
-# each call site would be two copies in one workflow file, and an edit to one
-# copy would leave the gate re-deriving against rules that classify never
-# used — a check that reports green on validation it did not perform. A file
-# is one copy by construction.
+# The policy is DATA. It is parsed, never executed, and that is the whole of
+# the trust story: nothing a consumer writes in it runs anywhere.
 #
-# What that costs is the whole of the care below. On a pull_request event the
-# checkout is the merge ref, so this file is the PULL REQUEST'S copy, and two
-# separate things follow:
+# This began as a sourced shell file, which cost four review rounds to
+# discover was indefensible. On a pull_request event the checkout is the
+# merge ref, so the file is the PULL REQUEST'S copy -- and a sourced file IS
+# the shell. It controlled the positional parameters (`set -- classify` made
+# `lanes.sh gate` run the classify arm and exit 0 without ever reading
+# CLASSIFY or RESULTS), the environment read later, PATH, and a `gh()`
+# function shadowing every API call the classification rests on. Isolating it
+# in a subshell fixed the reach into engine state and none of the rest: a
+# subshell still inherits the token, the network and a writable disk.
 #
-#   - it cannot be asked whether edits to itself are documentation, which
-#     would let a pull request answer the one question its answer must not
-#     decide -- and both modes would agree, the gate being independent of
-#     classify's output but not of the policy they share. is_policy_file()
-#     settles that in the engine: the config is code, always.
-#   - it is never sourced into this shell at all. See policy_query below.
+# Each of those was a different name for the same mistake, which was letting
+# it run at all. So it does not.
 #
-# The config defines is_docs() and LANE_PREFIXES, and may override
-# dispatch_without_pr_ok(). Everything else is engine.
+# Patterns are matched with `case`, which expands the pattern word once. A
+# variable's VALUE is not re-scanned, so `$(...)` or a backtick inside a rule
+# is inert text rather than a command -- verified by test, not assumed.
+#
+# Format, one directive per line:
+#
+#   docs <pattern>          paths matching this are documentation
+#   code <pattern>          paths matching this are code
+#   prefixes <words>        commit-subject prefixes the docs lane accepts
+#   dispatch-without-pr refuse|allow
+#
+# `docs` and `code` are ordered: FIRST match wins, and anything matching no
+# rule is code. Full-line comments start with `#`; a trailing comment starts
+# at whitespace-then-`#`, so a pattern cannot contain " #".
+#
+# Patterns are path-AWARE: `*` never crosses `/`, so `*.md` means markdown at
+# the repository root and nothing deeper. Use `docs/*.md` for one level down
+# and `**/*.md` for any depth. That is gitignore's rule rather than bash's --
+# a bare `case` would let `*` cross `/` -- and matches_pattern below is what
+# enforces it.
 
 LANES_CONFIG=${LANES_CONFIG:?the config path must be set}
 if [ ! -f "$LANES_CONFIG" ]; then
@@ -47,76 +67,126 @@ if [ ! -f "$LANES_CONFIG" ]; then
   exit 1
 fi
 
-# The policy is NEVER sourced into this shell. Every question is put to a
-# child that shares nothing back but an exit status or one line of stdout.
-#
-# On a pull_request event the checkout is the merge ref, so this file is the
-# pull request's own copy -- and a sourced file IS the shell, not a set of
-# definitions. It would control the positional parameters (a config holding
-# `set -- classify` makes `lanes.sh gate` run the classify arm and exit 0
-# without ever reading CLASSIFY or RESULTS -- the required check green over
-# failed heavy jobs), the environment the engine reads later, PATH, and a
-# `gh()` function shadowing every API call the classification rests on.
-#
-# There is no list of those to defend, which is the point: the previous
-# version guarded the config PATH and left the shell wide open behind it.
-# Isolation is structural, so the vectors do not have to be enumerated.
-#
-# stdout is sent to stderr while the policy loads, so a config that prints
-# cannot be mistaken for the answer.
-policy_query() {
-  local fn=$1
-  shift
-  (
-    # shellcheck source=/dev/null
-    . "$LANES_CONFIG" >&2 || exit 9
-    declare -F is_docs >/dev/null || exit 8
-    # `$fn` rather than `$@` because a config holding `set --` replaces the
-    # child's own argv. It can clobber `fn` too -- but everything it can do
-    # in here ends at this child's exit status, which the engine reads as a
-    # refusal, so the worst it buys is failing its own query closed.
-    "$fn" "$@"
-  )
+# Rules as verdict<TAB>pattern lines, in file order.
+RULES=''
+LANE_PREFIXES=''
+DISPATCH_WITHOUT_PR=refuse
+
+parse_policy() {
+  local line directive rest lineno=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    lineno=$((lineno + 1))
+    # Trailing comment, then surrounding whitespace.
+    case "$line" in *" #"*) line=${line%%" #"*} ;; esac
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
+    test -n "$line" || continue
+    case "$line" in '#'*) continue ;; esac
+
+    directive=${line%%[[:space:]]*}
+    rest=${line#"$directive"}
+    rest=${rest#"${rest%%[![:space:]]*}"}
+
+    case "$directive" in
+      docs|code)
+        if [ -z "$rest" ]; then
+          echo "::error::${LANES_CONFIG}:${lineno}: '${directive}' needs a pattern." >&2
+          return 1
+        fi
+        RULES="${RULES}${directive}	${rest}
+"
+        ;;
+      prefixes)
+        if [ -z "$rest" ]; then
+          echo "::error::${LANES_CONFIG}:${lineno}: 'prefixes' needs at least one prefix." >&2
+          return 1
+        fi
+        LANE_PREFIXES=$rest
+        ;;
+      dispatch-without-pr)
+        case "$rest" in
+          refuse|allow) DISPATCH_WITHOUT_PR=$rest ;;
+          *)
+            echo "::error::${LANES_CONFIG}:${lineno}: 'dispatch-without-pr' takes refuse or allow, not '${rest}'." >&2
+            return 1
+            ;;
+        esac
+        ;;
+      *)
+        # Refused rather than skipped. A typo'd directive silently ignored is
+        # a policy that quietly does less than it says -- which for a `code`
+        # rule means paths the author excluded riding the docs lane.
+        echo "::error::${LANES_CONFIG}:${lineno}: unknown directive '${directive}'." >&2
+        return 1
+        ;;
+    esac
+  done < "$LANES_CONFIG"
 }
 
-_policy_prefixes() { printf '%s' "${LANE_PREFIXES:-}"; }
+parse_policy || exit 1
 
-# Classify a whole file list in ONE child, rather than one per path: the
-# policy is sourced once, and a 3,000-file diff does not become 3,000 forks.
-_policy_classify() {
-  local new old
-  while IFS=$'\t' read -r new old; do
-    test -n "$new" || continue
-    is_docs "$new" || exit 1
-    if [ -n "$old" ]; then is_docs "$old" || exit 1; fi
-  done <<< "$1"
-  exit 0
-}
-
-# The default is refusal; a repo whose workflow legitimately dispatches
-# without a pull request (a deploy-force on the default branch) overrides
-# this in its config.
-_policy_dispatch_ok() {
-  if declare -F dispatch_without_pr_ok >/dev/null; then
-    dispatch_without_pr_ok
-  else
-    return 1
-  fi
-}
-
-# A config that loads but declares nothing would leave the engine with no
-# policy at all, and "no policy" must never read as "nothing is docs" — that
-# is a silent full-lane forever, which looks like the safe direction but
-# hides a broken config indefinitely. Refuse instead. Read once, here, into
-# engine state the policy cannot reach afterwards.
-if ! LANE_PREFIXES=$(policy_query _policy_prefixes); then
-  echo "::error::${LANES_CONFIG} could not be loaded, or defines no is_docs() — refusing to classify without a path policy." >&2
+# A policy that parsed but declares nothing would leave the engine with no
+# rules at all, and "no rules" must never read as "nothing is docs" — that is
+# a silent full-lane forever, which looks like the safe direction but hides a
+# broken config indefinitely. Refuse instead.
+if [ -z "$RULES" ]; then
+  echo "::error::${LANES_CONFIG} declares no docs or code rules — refusing to classify without a path policy." >&2
   exit 1
 fi
 if [ -z "$LANE_PREFIXES" ]; then
-  echo "::error::${LANES_CONFIG} sets no LANE_PREFIXES — refusing to lint subjects against an empty prefix list." >&2
+  echo "::error::${LANES_CONFIG} sets no prefixes — refusing to lint subjects against an empty prefix list." >&2
   exit 1
 fi
+
+# How many `/` a string contains.
+slashes() {
+  local rest=${1//[!\/]/}
+  printf '%s' "${#rest}"
+}
+
+# Does a path match a rule pattern?
+#
+# Path-AWARE, which bash `case` is not: a bare `*` in a case pattern happily
+# crosses `/`, so `*.md` would match `docs/DESIGN.md` and a root-only rule
+# would be impossible to write. Depth is enforced separately -- a pattern
+# without `**` must match a path of the SAME depth, so `*` is confined to one
+# segment the way it is in gitignore and every other tool anyone has used.
+#
+#   *.md         matches README.md, NOT docs/DESIGN.md
+#   docs/*.md    matches docs/DESIGN.md, NOT docs/a/B.md
+#   **/*.md      matches markdown at any depth
+#   docs/**      matches everything under docs/
+#
+# `**` opts out of the depth check and falls through to `case`, where it
+# behaves as an ordinary crossing wildcard.
+matches_pattern() {
+  local path=$1 pattern=$2
+  case "$pattern" in
+    *'**'*) ;;
+    *) test "$(slashes "$path")" = "$(slashes "$pattern")" || return 1 ;;
+  esac
+  # Unquoted on purpose: this is glob matching. The value is not re-scanned
+  # for expansions, so a rule holding $(...) is text, not a command.
+  # shellcheck disable=SC2254
+  case "$path" in
+    $pattern) return 0 ;;
+  esac
+  return 1
+}
+
+# First match wins; unmatched is code.
+is_docs() {
+  local path=$1 verdict pattern
+  while IFS=$'\t' read -r verdict pattern; do
+    test -n "$pattern" || continue
+    if matches_pattern "$path" "$pattern"; then
+      test "$verdict" = docs
+      return
+    fi
+  done <<< "$RULES"
+  return 1
+}
+
 
 # --- Engine ----------------------------------------------------------------
 
@@ -280,16 +350,15 @@ docs_only() {
   done <<< "$files"
   # An empty diff is not a docs diff; refuse to vouch for it.
   test "$any" = true || return 1
-  # Everything else is the policy's call, made in a child process.
-  policy_query _policy_classify "$files"
-  case $? in
-    0) return 0 ;;
-    1) return 1 ;;
-    # 8/9 are a policy that vanished or stopped loading between the check at
-    # startup and now; anything else is a child that died. Neither is a
-    # classification, so neither may read as one.
-    *) return 2 ;;
-  esac
+  # Everything else is the policy's call. Evaluated here rather than in a
+  # child, because the policy is data now -- there is nothing to contain.
+  while IFS=$'\t' read -r new old; do
+    test -n "$new" || continue
+    is_docs "$new" || return 1
+    # A rename is only docs if the path it LEFT was docs too.
+    if [ -n "$old" ]; then is_docs "$old" || return 1; fi
+  done <<< "$files"
+  return 0
 }
 
 
@@ -391,7 +460,7 @@ verify_dispatch_binding() {
   # branch), in which case docs_only classifies it as code and the full lane
   # runs.
   if [ -z "${PR:-}" ]; then
-    if policy_query _policy_dispatch_ok; then return 0; fi
+    if [ "$DISPATCH_WITHOUT_PR" = allow ]; then return 0; fi
     echo "::error::A dispatched run must name the pull request it reports for (the pr input) — refusing without one."
     return 1
   fi
