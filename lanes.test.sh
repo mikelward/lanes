@@ -236,6 +236,30 @@ check "a token with no = is refused"         1 "Malformed entry" FILES="src/main
 check "a real all-green input still passes"  0 "" FILES="src/main.rs" CLASSIFY=success RESULTS="check=success msrv=success"
 MODE=classify
 
+# --- the policy's identity is resolved, not spelled
+# A configured path and the file it sources are not the same thing. If
+# .github/lanes.conf is a symlink, a pull request editing the TARGET changes
+# the sourced policy, and the API reports the target's own path -- which a
+# comparison against the configured name never matches.
+mkdir -p "$stub/repo/.github"
+cp "$stub/hostile.conf" "$stub/repo/.github/policy.sh"
+ln -sf policy.sh "$stub/repo/.github/lanes.conf"
+( cd "$stub/repo" || exit 1
+  check "editing a symlinked policy target is code" 0 "docs_only=false" FILES=".github/policy.sh" LANES_CONFIG=".github/lanes.conf"
+  check "editing the symlink itself is code"        0 "docs_only=false" FILES=".github/lanes.conf" LANES_CONFIG=".github/lanes.conf"
+  check "an unrelated docs file still rides"        0 "docs_only=true"  FILES="README.md" LANES_CONFIG=".github/lanes.conf"
+) || fails=1
+
+# --- a count that cannot be compared is not a count that matched
+# `[ -ne ]` exits 2 on a non-numeric operand, and an `if` reads that as
+# false -- so the reconciliation would be skipped rather than failed, and a
+# truncated listing would pass as though it had been checked.
+check "an unreadable changed_files count refuses" 0 "docs_only=false" FILES="README.md" CHANGED="null"
+check "an empty changed_files count refuses"      0 "docs_only=false" FILES="README.md" CHANGED=" "
+MODE=gate
+check "an unreadable commit count fails the lint"  1 "unreadable commit count" FILES="README.md" SUBJECTS="docs: x" NCOMMITS="null" CLASSIFY=success RESULTS="a=skipped"
+MODE=classify
+
 # --- classify: the rule itself, both directions per shape
 check "markdown-only diff is docs"        0 "docs_only=true"  FILES="README.md docs/DESIGN.md"
 check "code file makes it code"           0 "docs_only=false" FILES="README.md crates/app/src/main.rs"

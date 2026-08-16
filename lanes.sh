@@ -136,15 +136,44 @@ count_lines() {
 }
 
 
-# Is this path the policy file the engine sourced?
+# Every repo-relative path that IS the policy, resolved once at startup.
 #
-# Compared with leading "./" stripped from both sides, because the config
-# input is a path a consumer writes by hand (".github/lanes.conf",
-# "./.github/lanes.conf") while the API always reports repo-relative paths.
-# A guard that a spelling can slip past is not a guard.
+# Two of them, because a configured path and the file it sources are not the
+# same thing. `.github/lanes.conf` may be a symlink to `.github/policy.sh`:
+# a pull request editing the TARGET changes the sourced policy, and the API
+# reports the target's own path, which a comparison against the configured
+# name never matches. A `..` segment aliases the same way in the other
+# direction -- `.github/../.github/lanes.conf` is a path the API will never
+# report -- so the configured spelling is canonicalized too.
+#
+# Both are guarded: editing the link itself is a policy change (it decides
+# what gets sourced) and so is editing what it points at.
+policy_paths() {
+  local literal=${LANES_CONFIG#./} resolved
+  printf '%s\n' "$literal"
+  # realpath is coreutils and resolves symlinks and `..` together. A path
+  # outside the repository, or one it cannot resolve, yields nothing extra
+  # -- the literal entry still stands, so this only ever adds guarding.
+  if resolved=$(realpath --relative-to="$PWD" "$LANES_CONFIG" 2>/dev/null); then
+    case "$resolved" in
+      ../*|/*) ;;
+      *) test "$resolved" = "$literal" || printf '%s\n' "$resolved" ;;
+    esac
+  fi
+}
+
+# Resolved once, before anything is classified: the engine's own idea of
+# which paths count as the policy must not be recomputed per file, and must
+# not depend on anything the policy can influence.
+POLICY_PATHS=$(policy_paths)
+
 is_policy_file() {
-  local a=${1#./} b=${LANES_CONFIG#./}
-  test "$a" = "$b"
+  local candidate=${1#./} known
+  while IFS= read -r known; do
+    test -n "$known" || continue
+    test "$candidate" = "$known" && return 0
+  done <<< "$POLICY_PATHS"
+  return 1
 }
 
 has_lane_prefix() {
@@ -178,6 +207,17 @@ pr_files() {
     echo "::error::Could not list the pull request's files." >&2
     return 1
   }
+  # A non-numeric count makes `[ -ne ]` exit 2, and an `if` reads that as
+  # false -- so the reconciliation below would be SKIPPED rather than failed,
+  # and a truncated listing would sail through as though it had been checked.
+  # The one guard here whose whole job is catching a partial list must not
+  # have "and if the count is unreadable, don't check" as a silent branch.
+  case "$declared" in
+    ''|*[!0-9]*)
+      echo "::error::The pull request reported an unreadable changed_files count ('${declared}') — refusing to classify against a total that cannot be compared." >&2
+      return 1
+      ;;
+  esac
   listed=$(count_lines "$files")
   if [ "$listed" -ne "$declared" ]; then
     echo "::error::File list incomplete: listed ${listed} of ${declared} changed files (the API caps at 3,000) — refusing to classify." >&2
@@ -279,6 +319,12 @@ lint_prefixes() {
     echo "::error::Commit enumeration returned nothing — the prefix rule cannot be verified."
     return 1
   fi
+  case "$declared" in
+    ''|*[!0-9]*)
+      echo "::error::The pull request reported an unreadable commit count ('${declared}') — the prefix rule cannot be verified against a total that cannot be compared."
+      return 1
+      ;;
+  esac
   listed=$(count_lines "$subjects")
   if [ "$listed" -ne "$declared" ]; then
     echo "::error::Commit list incomplete: listed ${listed} of ${declared} commits (the API caps at 250) — the prefix rule cannot be verified."
