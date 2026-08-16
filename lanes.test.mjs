@@ -409,6 +409,46 @@ describe("changedPaths", () => {
   });
 });
 
+describe("the policy path's spelling", () => {
+  // A case-insensitive filesystem (macOS, Windows) opens `.github/LANES.conf`
+  // through the lowercase path without complaint, while the files API reports
+  // the repository's own spelling -- so the engine would read a policy under a
+  // name no guard recognizes. Linux CI cannot produce that filesystem, so the
+  // seams simulate it: lstat answers to the lowercase name, readdir reports
+  // what the repository actually spells.
+  const insensitive = (spelling) => ({
+    lstat: () => ({ isSymbolicLink: () => false }),
+    readdir: (dir) => (dir.endsWith(".github") ? [spelling] : [".github"]),
+    readFile: () => "docs **\nprefixes docs\n",
+  });
+
+  test("the exact spelling is read", () => {
+    const { lstat, readdir, readFile } = insensitive("lanes.conf");
+    assert.match(readPolicy(".", readFile, lstat, readdir), /docs \*\*/);
+  });
+
+  test("a case alias is refused, not read", () => {
+    const { lstat, readdir, readFile } = insensitive("LANES.conf");
+    assert.throws(() => readPolicy(".", readFile, lstat, readdir), /is not spelled that way on disk/);
+  });
+
+  test("a case alias in the diff is code whatever the policy says", () => {
+    // The other half, and the asymmetry is deliberate: the two names are one
+    // file on a case-insensitive filesystem, so a diff naming this can be an
+    // edit to the rules in force. Wrongly code costs a full lane; wrongly
+    // docs skips review of the rules themselves.
+    // Both spellings have to be reachable BY THE RULES, or the assertion
+    // passes on glob matching being case-sensitive and says nothing about the
+    // guard: `**` does not match a leading dot and no lowercase pattern
+    // matches `.GITHUB/`, so the fixture spells out each one.
+    const hostile = parsePolicy("docs .github/*.conf\ndocs .GITHUB/*.CONF\nprefixes docs\n").rules;
+    assert.equal(isDocs(".github/other.conf", hostile), true, "the lowercase rule really is permissive");
+    assert.equal(isDocs(".GITHUB/OTHER.CONF", hostile), true, "the uppercase rule really is permissive");
+    assert.equal(isDocs(".github/lanes.conf", hostile), false);
+    assert.equal(isDocs(".GITHUB/LANES.CONF", hostile), false);
+  });
+});
+
 describe("the entry point", () => {
   // The bug this covers is a silent success: while `lanes.mjs` ended in
   // `if (import.meta.url === `file://${process.argv[1]}`)`, a checkout under
