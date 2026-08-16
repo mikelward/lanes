@@ -117,10 +117,17 @@ site would put two copies in one workflow, and an edit to one copy would leave
 the gate re-deriving under rules `classify` never used: a required check
 reporting green on validation it did not perform.
 
-A file is one copy by construction. It also self-protects — a config file is
-not documentation under any sane policy, so a pull request that edits the
-lane's own rules classifies as **code** and runs the full heavy lane before
-anything can act on the new rules.
+A file is one copy by construction.
+
+**The engine, not the policy, decides that the policy file is code.** On a
+`pull_request` event the checkout is the pull request's merge ref, so the
+config sourced is the *pull request's* copy — and asking it whether edits to
+itself are documentation would let a pull request answer the one question its
+answer must not decide. A config returning docs for itself and for the source
+files beside it would skip the heavy jobs, and the gate would agree, because
+the gate is independent of `classify`'s **output** but not of the **policy**
+they share. So a diff touching the configured policy path classifies as code
+unconditionally, whatever `is_docs` says, on both sides of a rename.
 
 A config that cannot supply a policy is refused rather than defaulted: a
 missing file, one defining no `is_docs`, or one with an empty

@@ -92,6 +92,14 @@ cat > "$stub/noprefix.conf" <<'EOF'
 is_docs() { return 0; }
 EOF
 
+# A policy that claims everything is documentation, itself included. This is
+# what a pull request would ship to buy its own skip, so the engine's refusal
+# has to hold against it rather than against a well-behaved config.
+cat > "$stub/hostile.conf" <<'EOF'
+is_docs() { return 0; }
+LANE_PREFIXES="docs"
+EOF
+
 # A config that allows a dispatched run with no pull request.
 cat > "$stub/dispatch-ok.conf" <<'EOF'
 is_docs() { case "$1" in *.md) return 0 ;; *) return 1 ;; esac; }
@@ -156,6 +164,26 @@ check "a non-PR ref is refused"                1 "belongs to" FILES="README.md" 
 check "a prefix collision is not a match"      1 "belongs to" FILES="README.md" PR=1 GITHUB_REF=refs/pull/11/merge
 MODE=gate
 check "the gate refuses a mis-named pr too"    1 "belongs to" FILES="README.md" SUBJECTS="docs: x" CLASSIFY=success RESULTS="a=skipped" PR=2 GITHUB_REF=refs/pull/1/merge SHARED_PRS=2
+MODE=classify
+
+# --- the policy file is code, and the ENGINE decides that
+# On a pull_request event the sourced config is the pull request's own copy,
+# so asking it whether edits to itself are documentation lets the pull request
+# answer the one question its answer must not decide. Both modes would agree,
+# since the gate is independent of classify's output but not of the policy.
+check "editing the policy is code"             0 "docs_only=false" FILES="$stub/hostile.conf" LANES_CONFIG="$stub/hostile.conf"
+check "a hostile policy cannot buy its skip"   0 "docs_only=false" FILES="$stub/hostile.conf src/main.rs" LANES_CONFIG="$stub/hostile.conf"
+check "renaming the policy away is code"       0 "docs_only=false" FILES="docs/old.md:$stub/hostile.conf" LANES_CONFIG="$stub/hostile.conf"
+# The real asymmetry: a consumer writes "./.github/lanes.conf" by hand while
+# the API always reports repo-relative paths. Uses a config in the working
+# directory so both spellings of one file can actually be expressed.
+cp "$stub/hostile.conf" ./lanes-selftest.conf
+check "a ./ spelling does not slip past"       0 "docs_only=false" FILES="lanes-selftest.conf" LANES_CONFIG="./lanes-selftest.conf"
+check "and the plain spelling still matches"   0 "docs_only=false" FILES="lanes-selftest.conf" LANES_CONFIG="lanes-selftest.conf"
+rm -f ./lanes-selftest.conf
+check "an ordinary docs PR is unaffected"      0 "docs_only=true"  FILES="README.md"
+MODE=gate
+check "the gate refuses a policy-edit skip"    1 "refusing the skip" FILES="$stub/hostile.conf" SUBJECTS="docs: x" CLASSIFY=success RESULTS="a=skipped" LANES_CONFIG="$stub/hostile.conf"
 MODE=classify
 
 # --- classify: the rule itself, both directions per shape

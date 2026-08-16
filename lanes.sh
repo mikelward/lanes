@@ -27,9 +27,13 @@ set -euo pipefail
 # classify never used — a check that reports green on validation it did not
 # perform. A file is one copy by construction.
 #
-# It also self-protects: the config is not documentation by any sane policy,
-# so a pull request that edits the lane's own rules classifies as code and
-# runs the full heavy lane before anything can act on the new rules.
+# On a pull_request event the file sourced here is the PULL REQUEST'S copy of
+# it, since the checkout is the merge ref. So the policy cannot be trusted to
+# say whether edits to the policy are documentation -- that would let a pull
+# request answer the one question its answer must not decide, and both modes
+# would agree with it, the gate being independent of classify's output but
+# not of the policy they share. is_policy_file() settles it in the engine
+# instead: the config is code, always, whatever the config says.
 #
 # The config defines is_docs() and LANE_PREFIXES, and may override
 # dispatch_without_pr_ok(). Everything else is engine.
@@ -79,6 +83,17 @@ count_lines() {
   printf '%s' "$n"
 }
 
+
+# Is this path the policy file the engine sourced?
+#
+# Compared with leading "./" stripped from both sides, because the config
+# input is a path a consumer writes by hand (".github/lanes.conf",
+# "./.github/lanes.conf") while the API always reports repo-relative paths.
+# A guard that a spelling can slip past is not a guard.
+is_policy_file() {
+  local a=${1#./} b=${LANES_CONFIG#./}
+  test "$a" = "$b"
+}
 
 has_lane_prefix() {
   local subject=$1 p
@@ -161,9 +176,22 @@ docs_only() {
   while IFS=$'\t' read -r new old; do
     test -n "$new" || continue
     any=true
+    # The policy file is code, and the engine decides that -- never the
+    # policy. On a pull_request event the checkout is the PR's own merge ref,
+    # so the config sourced above is the PR's version: asking it whether
+    # edits to itself are documentation lets a pull request answer the one
+    # question its answer must not decide. It could return docs for both the
+    # config and the source files beside it, and BOTH modes would agree,
+    # because the gate re-derives independently of classify's output but not
+    # independently of the policy they share.
+    is_policy_file "$new" && return 1
     is_docs "$new" || return 1
-    # A rename is only docs if the path it LEFT was docs too.
-    if [ -n "$old" ]; then is_docs "$old" || return 1; fi
+    # A rename is only docs if the path it LEFT was docs too -- including a
+    # rename that moves the policy file out of the way.
+    if [ -n "$old" ]; then
+      is_policy_file "$old" && return 1
+      is_docs "$old" || return 1
+    fi
   done <<< "$files"
   # An empty diff is not a docs diff; refuse to vouch for it.
   test "$any" = true
