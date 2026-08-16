@@ -59,6 +59,16 @@ prefixes design docs todo test build refactor
 
 # Optional; defaults to refuse.
 dispatch-without-pr refuse
+
+# Optional; defaults to YES. Whether the PULL REQUEST TITLE must carry a prefix
+# too. Two independent reasons: under a SQUASH merge the title is the subject
+# that lands, so linting only the commits leaves it unchecked; and whatever the
+# merge strategy, the title is what the pull request LIST shows, so a prefix
+# says at a glance whether a pull request changes what the app does. On by
+# default because the errors are asymmetric — off when it was wanted is silent,
+# on when it was not is a red check naming the one-line fix. Set it to `no` if
+# neither reason applies; the commit subjects are linted either way.
+lint-title yes
 ```
 
 **`*` never crosses `/`.** Matching is `path.matchesGlob`, Node's own, rather
@@ -82,12 +92,24 @@ that quietly does less than it says.
 ### 2. The jobs
 
 ```yaml
+on:
+  pull_request:
+    # `edited` is load-bearing, not tidiness. A retarget changes what the diff
+    # is measured against while the head -- and any `gate` check run already
+    # minted on it -- stays exactly where it was, so a base change has to start
+    # a fresh run or the old verdict simply stands. Title and body edits re-run
+    # too, deliberately: the title is a subject a squash merge lands, and
+    # skipping the gate on a "harmless" edit would be worse than running it,
+    # because GitHub counts a SKIPPED required check as satisfied.
+    types: [opened, synchronize, reopened, edited]
+
 jobs:
   classify:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       docs_only: ${{ steps.lane.outputs.docs_only }}
+      base_sha: ${{ steps.lane.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -117,6 +139,12 @@ jobs:
           mode: gate
           pr: ${{ github.event.pull_request.number }}
           classify-result: ${{ needs.classify.result }}
+          # Only read on a dispatched run, and harmless on a pull_request one,
+          # which takes the same commit from its own event payload. Wire it
+          # anyway: without it a PR-bound workflow_dispatch cannot certify a
+          # green, because nothing else records the base the heavy jobs built
+          # against — the gate runs after them.
+          base-sha: ${{ needs.classify.outputs.base_sha }}
           results: >-
             check=${{ needs.check.result }}
             msrv=${{ needs.msrv.result }}
@@ -128,6 +156,87 @@ never reports on the docs lane, so nothing merges.
 
 `permissions: contents: read` and `pull-requests: read` are enough; the engine
 writes nothing.
+
+## What binds a verdict to the diff it was computed for
+
+A check run lands on a commit, and is read by whatever the pull request looks
+like *later*. Those two drift apart constantly in normal use — a force-push, a
+retarget, a stacked base moving underneath, a second pull request opened on the
+same head — and every one of them ends with a verdict labelling work nobody
+verified. So a verdict is bound at both ends:
+
+- **To its own trigger.** The head and base the run was started for come from
+  the event payload (`GITHUB_EVENT_PATH`), not from inputs — a consumer cannot
+  forget to wire them, and a run outlived by a force-push refuses rather than
+  judging the replacement's diff. The base is checked by **ancestry**, for every
+  base: an ordinary advance leaves the event's base commit an ancestor of the
+  tip and is fine, while a rewrite is refused. Exempting a branch for being the
+  default one would assume a branch protection no consumer has promised.
+- **To exactly one pull request.** A commit can head several open ones, and the
+  check is per-commit — so a gate minted for the docs one would satisfy the
+  code one. Ambiguity is refused, not resolved.
+- **After the fact, not only before it.** Every listing answers with the *current*
+  state, so the binding is re-read after the diff and after the prefix lint, and
+  a pull request that moved in between is refused. The `edited` and `synchronize`
+  events start a fresh run but cancel nothing, so both verdicts would otherwise
+  land on the same commit with no ordering between them.
+- **To one base commit, exactly, on both verdicts.** At settlement the **event's**
+  base commit must still be the branch tip. *Exact* rather than un-rewritten,
+  because ancestry is not enough on either path: green rests on the heavy jobs
+  having built `merge(head, base)`, and a skip — which looks laxer, resting on a
+  classification rather than evidence — is not, since `base...head` is measured
+  from the **merge base**, so advancing the base *into the head's own history*
+  **drops** commits from the diff rather than adding paths to it, and a head
+  that changes code and then reverts it reads as documentation from the old base
+  and as code from the new one. The *event's* commit rather than the tip the run
+  read, because the two verdicts rest on bases read at different moments — the
+  heavy jobs built against the base near the event, the classification against
+  the tip when the gate runs — so pinning the live tip guards one and lets the
+  other go stale. Requiring the event's commit to still be the tip collapses the
+  difference. The window is only as long as the run, and the remedy is the
+  ordinary one — GitHub's own *require branches to be up to date*, or one push.
+
+### Require branches to be up to date
+
+**Turn on *require branches to be up to date before merging* in the ruleset, next
+to requiring `gate`.** It is a prerequisite, not a nicety, and it is what keeps a
+published verdict honest.
+
+A check run lands on a commit; the ruleset reads it whenever you press Merge.
+Between those two moments the diff can change out from under it in two ways — the
+pull request is **retargeted**, or someone **pushes to the base branch** — and
+both move the merge base, so `base...head` is no longer what was classified. A
+skip blessed against the old diff is still sitting there, green.
+
+Nothing inside a GitHub Action can expire a check that has already been
+published. The up-to-date requirement is GitHub refusing the merge instead: the
+head is behind, so the branch must be updated, and updating it pushes a commit
+that re-runs everything.
+
+**It does not cover every retarget, and the gap is worth knowing.** It fires when
+the head is *behind* the new base. Retarget to a branch the head is already
+**ahead** of — an older release branch that `main` has since moved past — and the
+head already contains it, so nothing is behind and nothing is forced. The diff is
+now everything between that branch and the old base, none of which was
+classified, and the old green skip still stands. **Keep `edited` in your
+`pull_request` types** (the example above has it): that is what starts a fresh
+run on a retarget, and it is the half the up-to-date rule cannot reach. The two
+together cover both directions; neither alone does.
+
+An earlier version of this action tried to answer the same question by reading
+the caller's workflow and looking for an `edited` trigger. It is gone, and the
+reasons are worth keeping: it took a dozen review findings to approximate a YAML
+parser and the list of valid spellings never ended; it could be handed a
+different file than the one that started the run; and — decisively — `edited`
+fires on a retarget but **nothing at all fires when the base branch is pushed
+to**, so it was blind to half the problem by construction.
+
+If you cannot use the setting, the fallback is a single-writer sweep that
+recomputes and republishes `gate` when the base moves. Note *single-writer*: two
+workflows publishing one check is an ordering race, and the PR's own run would
+have to stop publishing `gate` for the sweep to own it. A sweep is also
+eventually consistent, so it narrows the window rather than closing it — a
+backstop, not a replacement for the setting.
 
 ## Why the policy is data, and at a fixed path
 

@@ -104,6 +104,7 @@ export function parsePolicy(text) {
   const rules = [];
   let prefixes = [];
   let dispatchWithoutPr = "refuse";
+  let lintTitle = "yes";
 
   text.split("\n").forEach((raw, index) => {
     const lineno = index + 1;
@@ -128,6 +129,14 @@ export function parsePolicy(text) {
           throw new PolicyError(`${POLICY_PATH}:${lineno}: 'prefixes' needs at least one prefix.`);
         }
         prefixes = rest;
+        break;
+      case "lint-title":
+        if (argument !== "yes" && argument !== "no") {
+          throw new PolicyError(
+            `${POLICY_PATH}:${lineno}: 'lint-title' takes yes or no, not '${argument}'.`,
+          );
+        }
+        lintTitle = argument;
         break;
       case "dispatch-without-pr":
         if (argument !== "refuse" && argument !== "allow") {
@@ -158,7 +167,7 @@ export function parsePolicy(text) {
       `${POLICY_PATH} sets no prefixes — refusing to lint subjects against an empty prefix list.`,
     );
   }
-  return { rules, prefixes, dispatchWithoutPr };
+  return { rules, prefixes, dispatchWithoutPr, lintTitle: lintTitle === "yes" };
 }
 
 /**
@@ -258,6 +267,87 @@ export async function openPrsHeading(sha, ctx) {
   return prs.filter((p) => p.state === "open" && p.head.sha === sha).map((p) => p.number);
 }
 
+/**
+ * The live tip of a branch, read from the ref itself rather than from the
+ * pull request's cached `base.sha`, so the answer does not depend on how
+ * fresh that cache happens to be.
+ *
+ * Each segment is encoded separately: a ref name's slashes are real path
+ * separators, while a `#` or a space in a branch name would otherwise
+ * truncate the request to a different ref entirely.
+ */
+export async function baseTip(ref, ctx) {
+  const encoded = ref.split("/").map(encodeURIComponent).join("/");
+  const body = await api(`git/ref/heads/${encoded}`, ctx);
+  return body.object.sha;
+}
+
+/**
+ * Did this base branch only move FORWARD since the run was triggered?
+ *
+ * Replaces an earlier exemption that skipped the check whenever the base was
+ * the default branch, on the reasoning that a default branch is never
+ * force-pushed. That is a convention, not a property: a consumer whose
+ * ruleset permits it can rewrite `main`, moving the merge base while head and
+ * base ref both stand still -- the exact substitution the pin exists to catch,
+ * waved through by name. Ancestry asks the question directly instead, so an
+ * ordinary advance stays valid and a rewrite is refused, with no assumption
+ * about anyone's branch protection.
+ */
+export async function baseAdvancedOnly(pinnedSha, ref, ctx) {
+  return (await baseMovement(pinnedSha, ref, ctx)).advancedOnly;
+}
+
+/**
+ * The same question, returning the tip it read.
+ *
+ * The caller needs both answers -- was this a rewrite, and what is the base
+ * NOW -- and asking twice would let the branch move between them, which is
+ * the substitution this whole file exists to catch.
+ */
+export async function baseMovement(pinnedSha, ref, ctx) {
+  const tip = await baseTip(ref, ctx);
+  if (tip === pinnedSha) return { tip, advancedOnly: true };
+  // `per_page=1` because only the status is wanted: a busy branch would
+  // otherwise return up to 250 commits to answer a yes/no question.
+  const cmp = await api(`compare/${pinnedSha}...${tip}?per_page=1`, ctx);
+  return { tip, advancedOnly: cmp.status === "ahead" || cmp.status === "identical" };
+}
+
+/**
+ * The snapshot the run was TRIGGERED for, read from the event payload.
+ *
+ * Deliberately not action inputs. The consumer would have to wire three of
+ * them correctly in two jobs, and a workflow that forgot one would lose the
+ * guard silently while still looking configured -- whereas the payload is
+ * the event's own account of itself and cannot be miswired. It is also the
+ * only place the base COMMIT appears at all: the API answers with the pull
+ * request's current base, which is the thing being checked against.
+ */
+export function eventSnapshot(env, readFile = readFileSync) {
+  if (!env.GITHUB_EVENT_PATH) return null;
+  let payload;
+  try {
+    payload = JSON.parse(readFile(env.GITHUB_EVENT_PATH, "utf8"));
+  } catch (err) {
+    throw new PolicyError(
+      `Could not read the event payload (${err.message}) — refusing to report for a run whose ` +
+        `own trigger cannot be established.`,
+    );
+  }
+  const pr = payload.pull_request || {};
+  return {
+    head: pr.head ? pr.head.sha : null,
+    baseRef: pr.base ? pr.base.ref : null,
+    baseSha: pr.base ? pr.base.sha : null,
+  };
+}
+
+/** Does a subject carry one of the lane's prefixes? */
+export function hasPrefix(subject, prefixes) {
+  return prefixes.some((p) => subject.startsWith(`${p}: `));
+}
+
 // --- Binding ---------------------------------------------------------------
 
 /**
@@ -281,15 +371,187 @@ export function verifyPrBinding({ event, pr, ref }) {
 }
 
 /**
+ * A run must still describe the pull request it was triggered for, BEFORE any
+ * verdict -- the all-green path included.
+ *
+ * The check run lands on the head commit and is read by whatever the pull
+ * request looks like now, so a run outlived by a force-push, a retarget, a
+ * moved stacked base, or a twin pull request must not report even when its
+ * heavy jobs passed: they validated a merge snapshot the pull request no
+ * longer shows, and the newer event's own run owns the verdict.
+ *
+ * Returns the snapshot it proved, so the caller can settle against it after
+ * the later reads. `verifyPrBinding` answers a different question -- whether
+ * this run belongs to the pull request the input names -- and neither
+ * subsumes the other.
+ */
+export async function verifyEventBinding({ event, pr, snapshot }, ctx) {
+  if (event !== "pull_request") return null;
+  if (!pr) {
+    throw new PolicyError(
+      `A pull_request run cannot verify its event without the pull request number.`,
+    );
+  }
+  // All three, not just the head. Treating the base fields as optional made
+  // every guard below them conditional on data that a `pull_request` payload
+  // always carries -- so a truncated or malformed one did not refuse, it
+  // silently DEGRADED: no retarget check, no rewrite check, and `pin.baseSha`
+  // left null so settlement skipped the base entirely and published a green
+  // for a snapshot nothing had verified. A guard that turns itself off when
+  // its input is missing is the failure this file exists to prevent.
+  const missing = ["head", "baseRef", "baseSha"].filter((k) => !snapshot || !snapshot[k]);
+  if (missing.length) {
+    throw new PolicyError(
+      `The event payload is missing ${missing.join(", ")} — refusing to report for a run whose ` +
+        `own trigger cannot be established.`,
+    );
+  }
+  const meta = await api(`pulls/${pr}`, ctx);
+  if (meta.head.sha !== snapshot.head) {
+    throw new PolicyError(
+      `The pull request's head moved after this run's event (${snapshot.head} -> ${meta.head.sha}) — ` +
+        `the replacement head's own run owns the verdict.`,
+    );
+  }
+  if (meta.base.ref !== snapshot.baseRef) {
+    throw new PolicyError(
+      `The pull request was retargeted after this run's event ` +
+        `('${snapshot.baseRef}' -> '${meta.base.ref}') — the new diff's own run owns the verdict.`,
+    );
+  }
+  const pin = { head: meta.head.sha, baseRef: meta.base.ref, baseSha: null, title: null };
+  // Every base, by ancestry rather than by name. An ordinary advance leaves
+  // the event's base commit an ancestor of the tip and does not move this
+  // pull request's own commits; a rewrite does not, and it moves the diff
+  // while head and ref both stand still.
+  const moved = await baseMovement(snapshot.baseSha, meta.base.ref, ctx);
+  if (!moved.advancedOnly) {
+    throw new PolicyError(
+      `The pull request's base branch was rewritten after this run's event ` +
+        `(${snapshot.baseSha} is no longer an ancestor of '${meta.base.ref}') — ` +
+        `the new diff's own run owns the verdict.`,
+    );
+  }
+  // The EVENT's commit, and settlement demands it exactly. Two different
+  // readers want two different bases -- the heavy jobs built against the
+  // base as it stood near the event, while `changedPaths()` classifies
+  // against whatever the API resolves when the gate runs -- and pinning
+  // either one alone leaves the other unguarded. Demanding the event's
+  // commit still be the tip at settlement is what makes them the same
+  // commit: any movement at all, before this run or during it, refuses
+  // instead of publishing a verdict one of the two readers never saw.
+  pin.baseSha = snapshot.baseSha;
+  // A green build proves this pull request's merge snapshot, but the check
+  // run lands on the commit -- which a twin sharing the head reads too, its
+  // own base never validated.
+  const heads = await openPrsHeading(meta.head.sha, ctx);
+  if (heads.length !== 1 || heads[0] !== Number(pr)) {
+    throw new PolicyError(
+      `Commit ${meta.head.sha} heads open pull requests [${heads.join(", ")}] — ` +
+        `a per-commit gate cannot vouch for exactly one, so this run refuses to report.`,
+    );
+  }
+  return pin;
+}
+
+/**
+ * Re-read everything the verdict rests on, after the reads that produced it.
+ *
+ * Every listing above answers with the pull request's CURRENT state, so a
+ * force-push or a retarget landing between the binding and those calls puts
+ * the REPLACEMENT's diff, or its subjects, under this run's verdict. The
+ * `edited` and `synchronize` events start a fresh run but cancel nothing, so
+ * both verdicts land on the same commit with no ordering between them.
+ *
+ * The title is RE-VALIDATED rather than compared: a benign retitle leaves the
+ * squash subject just as honest, and failing a correct run for it would be an
+ * alarm with nothing behind it. Everything else is compared, because any
+ * movement there changes what was actually built.
+ *
+ * The base is compared EXACTLY to the EVENT's commit, on both verdicts, and
+ * both halves of that took a review round each to arrive at.
+ *
+ * Exact, because ancestry is not enough on either path. Green is the obvious
+ * one: the heavy jobs built merge(head, base), so once the base moves that is
+ * no longer the snapshot the pull request lands. A skip looks laxer and is
+ * not -- `base...head` is measured from the merge base, so advancing the base
+ * INTO the head's own history DROPS commits from the diff rather than adding
+ * paths to it, and a head that changes code in one commit and reverts it in
+ * the next classifies as documentation from the old base and as code from the
+ * new one.
+ *
+ * The event's commit rather than the tip this run read, because the two
+ * verdicts rest on bases read at different moments: the heavy jobs built
+ * against the base as it stood near the event, and `changedPaths()`
+ * classifies against whatever the API resolves when the gate runs. Pinning
+ * the live tip guards the second and lets the first go stale. Requiring the
+ * event's commit to still BE the tip collapses the difference -- when it
+ * holds, both readers saw the same commit -- and when it doesn't, this
+ * refuses rather than guessing which reader was right. The window is only as
+ * long as the run, and the standard remedy -- GitHub's own "require branches
+ * to be up to date", or one push -- already exists.
+ */
+export async function stillPinned(pr, pin, policy, ctx) {
+  if (!pin) return;
+  // ORDER MATTERS, and it is the only thing here that can matter.
+  //
+  // No finite sequence of reads closes a time-of-check/time-of-use gap against
+  // a remote anyone can change: whatever is read last, something can move after
+  // it. What ordering buys is the SIZE of the window between confirming this
+  // run still describes the pull request and acting on that. So the reads that
+  // do not establish identity go first, and the one that does goes last, with
+  // nothing but the return after it.
+  //
+  // Read the other way round -- identity first -- a retarget landing during the
+  // later calls left them inspecting the OLD base's tip and a head association
+  // a retarget does not disturb, so nothing saw it and the run reported for a
+  // diff the pull request had stopped having.
+  //
+  // The window that outlives the run is the larger one and is not this
+  // function's to close: a published check is overwritten by the fresh run a
+  // retarget starts, or the merge is blocked. See the README.
+  if (pin.baseSha) {
+    const tip = await baseTip(pin.baseRef, ctx);
+    if (tip !== pin.baseSha) {
+      throw new PolicyError(
+        `The base branch moved from ${pin.baseSha} to ${tip} while this run was reading the pull ` +
+          `request — the verdict was computed against a snapshot it no longer lands. Update the ` +
+          `branch, or push, and the fresh run will report for the new one.`,
+      );
+    }
+  }
+  const heads = await openPrsHeading(pin.head, ctx);
+  if (heads.length !== 1 || heads[0] !== Number(pr)) {
+    throw new PolicyError(
+      `Commit ${pin.head} gained a second open pull request while the gate was reading it — ` +
+        `a per-commit gate cannot vouch for exactly one.`,
+    );
+  }
+  const meta = await api(`pulls/${pr}`, ctx);
+  if (meta.head.sha !== pin.head || meta.base.ref !== pin.baseRef) {
+    throw new PolicyError(
+      `The pull request moved while the gate was reading it — refusing to report a verdict ` +
+        `for a snapshot it no longer shows.`,
+    );
+  }
+  if (pin.title !== null && !hasPrefix(meta.title || "", policy.prefixes)) {
+    throw new PolicyError(
+      `The pull request's title lost its prefix while the gate was reading it — refusing to ` +
+        `bless a skip for a title a squash merge would land as a behavior change.`,
+    );
+  }
+}
+
+/**
  * A dispatched run must name the pull request it reports for, and that pull
  * request must BE the checked-out commit: `--ref` picks the branch and the
  * input supplies the number independently, so nothing else stops a dispatch
  * on code PR A's branch from landing docs PR B's verdict on A's head.
  */
-export async function verifyDispatchBinding({ event, pr, sha, dispatchWithoutPr }, ctx) {
-  if (event !== "workflow_dispatch") return;
+export async function verifyDispatchBinding({ event, pr, sha, dispatchWithoutPr, baseSha }, ctx) {
+  if (event !== "workflow_dispatch") return null;
   if (!pr) {
-    if (dispatchWithoutPr === "allow") return;
+    if (dispatchWithoutPr === "allow") return null;
     throw new PolicyError(
       `A dispatched run must name the pull request it reports for — refusing without one.`,
     );
@@ -311,6 +573,18 @@ export async function verifyDispatchBinding({ event, pr, sha, dispatchWithoutPr 
         `a per-commit gate cannot vouch for exactly one, so a dispatched run refuses to report.`,
     );
   }
+  // A pin, for the same reason `verifyEventBinding` returns one: a dispatched
+  // run reaches the all-green path too -- a weekly dependency job's own CI run
+  // is exactly that.
+  //
+  // The base comes from the CALLER, carried forward from classify's `base_sha`
+  // output, and reading it here instead would prove nothing: the gate runs
+  // AFTER the heavy jobs, so a base sampled here settles against itself and
+  // agrees by construction, no matter what the jobs actually built against. A
+  // `pull_request` run gets this for free from its event payload; a dispatch
+  // has no such record, so the caller supplies one or the gate refuses to
+  // certify the green (see `gate`).
+  return { head: sha, baseRef: meta.base.ref, baseSha: baseSha || null, title: null };
 }
 
 // --- Modes -----------------------------------------------------------------
@@ -371,9 +645,42 @@ export async function classifyOrCode(work, warn = (m) => process.stdout.write(m)
 }
 
 /** Every commit subject on the docs lane must carry one of the prefixes. */
-export async function lintPrefixes(pr, policy, ctx) {
+export async function lintPrefixes(pr, policy, ctx, pin = null) {
   const meta = await api(`pulls/${pr}`, ctx);
   const declared = requireCount(meta.commits, "commit");
+  // Configurable, and ON by default. NOT because of squash merges -- that was
+  // the first reasoning here and it is wrong for any consumer that rebases,
+  // where the title never lands on the default branch at all. Two independent
+  // reasons, and the second is the one that holds either way:
+  //
+  //   - under a squash the title IS the subject that lands, so linting only
+  //     the commits leaves the one line the merge ships unchecked;
+  //   - whatever the merge strategy, the title is what a pull request LIST
+  //     shows, so a prefix says at a glance whether a pull request changes
+  //     what the app does.
+  //
+  // Default on because the two ways to get it wrong are not symmetric. Off
+  // when it was wanted is SILENT -- a check the repository used to have simply
+  // stops running, with nothing red to notice it by. On when it was not wanted
+  // is a red check naming the fix, cleared by one line of config. A consumer
+  // that wants neither reason sets `lint-title no`; the commit lint below runs
+  // regardless, and it is the one that guards what actually lands.
+  if (policy.lintTitle) {
+    const title = meta.title || "";
+    if (!title) {
+      throw new PolicyError(
+        `The pull request has no title to check — the prefix rule cannot be verified.`,
+      );
+    }
+    if (!hasPrefix(title, policy.prefixes)) {
+      throw new PolicyError(
+        `Docs-lane pull request title lacks a prefix: '${title}' — prefix it ` +
+          `(${policy.prefixes.map((p) => `${p}:`).join("/")}) so a squash merge cannot land it ` +
+          `as a behavior-change subject.`,
+      );
+    }
+    if (pin) pin.title = title;
+  }
   const commits = await api(`pulls/${pr}/commits?per_page=100`, ctx);
   if (commits.length !== declared) {
     throw new PolicyError(
@@ -387,7 +694,7 @@ export async function lintPrefixes(pr, policy, ctx) {
     // subject merely starts with "Merge" is not one.
     if ((c.parents || []).length > 1) continue;
     const subject = (c.commit.message || "").split("\n")[0];
-    if (!policy.prefixes.some((p) => subject.startsWith(`${p}: `))) bad.push(subject);
+    if (!hasPrefix(subject, policy.prefixes)) bad.push(subject);
   }
   if (bad.length) {
     throw new PolicyError(
@@ -463,7 +770,7 @@ export function parseResults(raw) {
 }
 
 /** The verdict the ruleset requires. Throws to fail the check. */
-export async function gate(env, policy, ctx) {
+export async function gate(env, policy, ctx, pin = null) {
   if (env.classifyResult !== "success") {
     throw new PolicyError(
       `classify did not succeed (result: ${env.classifyResult}) — nothing vouches for this diff.`,
@@ -472,7 +779,37 @@ export async function gate(env, policy, ctx) {
   const results = parseResults(env.results);
   const allSuccess = results.every((r) => r.result === "success");
   const allSkipped = results.every((r) => r.result === "skipped");
-  if (allSuccess) return;
+  // A dispatched run has no event payload, so the only base it can bind to is
+  // the one the CALLER carried forward from classify. Without it there is
+  // nothing to settle against, on EITHER path:
+  //
+  //   - green: the gate would read the base AFTER the heavy jobs and compare
+  //     it with itself, agreeing by construction whatever they built against.
+  //   - skip: `classify` re-derives the diff here, but "here" is several reads
+  //     long. A base advancing between the reclassification and settlement
+  //     leaves `stillPinned` comparing only the head and the base's NAME --
+  //     neither of which an advance changes -- and the skip publishes for a
+  //     diff measured against a base that has already moved.
+  //
+  // The skip case was missed on the reasoning that re-deriving against the
+  // current base made a pin redundant. It does not: it makes the pin the only
+  // thing that says WHICH current base, across reads a push can straddle.
+  if (env.event === "workflow_dispatch" && env.pr && !(pin && pin.baseSha)) {
+    throw new PolicyError(
+      `This dispatched run reports for #${env.pr}, but nothing records the base it was ` +
+        `measured against — so a base that moved while it ran cannot be detected. Pass ` +
+        `classify's 'base_sha' output to the gate's 'base-sha' input.`,
+    );
+  }
+  if (allSuccess) {
+    // The heavy jobs vouch for this run's merge snapshot, and the binding
+    // proved that snapshot was still the pull request's -- but across several
+    // separate reads. Settle before reporting, exactly as the skip path does:
+    // a green verdict for a snapshot the pull request no longer shows is the
+    // same failure as an unjustified skip, arrived at from the other side.
+    await stillPinned(env.pr, pin, policy, ctx);
+    return;
+  }
   if (!allSkipped) {
     throw new PolicyError(
       `Heavy job results '${env.results}' — not all green, and not a justified skip.`,
@@ -485,7 +822,9 @@ export async function gate(env, policy, ctx) {
       `Heavy jobs were skipped but the diff could not be verified as docs-only — refusing the skip.`,
     );
   }
-  await lintPrefixes(env.pr, policy, ctx);
+  await lintPrefixes(env.pr, policy, ctx, pin);
+  // After every read the verdict rests on, not before them.
+  await stillPinned(env.pr, pin, policy, ctx);
 }
 
 // --- The run --------------------------------------------------------------
@@ -513,9 +852,11 @@ export async function main(env = process.env) {
   }
   const ctx = { token: input("token"), repo: env.GITHUB_REPOSITORY };
 
+  let baseSha = "";
   // One body for both modes, so neither can grow a check the other lacks.
   const work = async () => {
     const policy = parsePolicy(readPolicy());
+    const snapshot = eventSnapshot(env);
     const shared = {
       event: env.GITHUB_EVENT_NAME,
       pr: input("pr"),
@@ -524,11 +865,23 @@ export async function main(env = process.env) {
       classifyResult: input("classify-result"),
       results: input("results"),
       dispatchWithoutPr: policy.dispatchWithoutPr,
+      baseSha: input("base-sha"),
+      snapshot,
     };
     verifyPrBinding(shared);
-    await verifyDispatchBinding(shared, ctx);
-    if (mode === "classify") return classify(shared, policy, ctx);
-    await gate(shared, policy, ctx);
+    // Exactly one of these returns a pin; the other is a no-op for this event.
+    const pin =
+      (await verifyEventBinding(shared, ctx)) || (await verifyDispatchBinding(shared, ctx));
+    if (mode === "classify") {
+      // Recorded HERE, before the heavy jobs run, which is the only moment at
+      // which it is worth anything. A pull_request run has the same commit in
+      // its event payload and ignores this; a dispatch has no other source.
+      baseSha =
+        (snapshot && snapshot.baseSha) ||
+        (pin && pin.baseRef ? await baseTip(pin.baseRef, ctx) : "");
+      return classify(shared, policy, ctx);
+    }
+    await gate(shared, policy, ctx, pin);
     return false;
   };
 
@@ -538,6 +891,10 @@ export async function main(env = process.env) {
     return;
   }
   const docsOnly = await classifyOrCode(work);
-  if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `docs_only=${docsOnly}\n`);
-  else process.stdout.write(`docs_only=${docsOnly}\n`);
+  // Emitted even when the classification failed to establish: the gate's own
+  // binding is a separate question from what the diff turned out to be, and a
+  // blank here would refuse a green the caller could have proved.
+  const out = `docs_only=${docsOnly}\nbase_sha=${baseSha}\n`;
+  if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, out);
+  else process.stdout.write(out);
 }

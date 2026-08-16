@@ -30,7 +30,11 @@ import {
   parseResults,
   readPolicy,
   verifyDispatchBinding,
+  verifyEventBinding,
   verifyPrBinding,
+  eventSnapshot,
+  stillPinned,
+  baseTip,
 } from "./lanes.mjs";
 
 /** A stubbed API: canned bodies keyed by a substring of the request path. */
@@ -39,17 +43,32 @@ import {
 // Defaulting them with `??` meant a deliberately unreadable count fell
 // through to the real one, so the guard under test never saw a bad value and
 // the case passed while asserting nothing.
-function stub({ files = [], changed, commits = [], nCommits, headSha = "headsha", pulls = null } = {}) {
+function stub({
+  files = [],
+  changed,
+  commits = [],
+  nCommits,
+  headSha = "headsha",
+  pulls = null,
+  title = "docs: A pull request",
+  baseRef = "main",
+  tip = "basetip",
+  compare = "ahead",
+} = {}) {
   const routes = [
     [/\/pulls\/\d+\/files/, () => files],
     [/\/pulls\/\d+\/commits/, () => commits],
     [/\/commits\/[^/]+\/pulls/, () => pulls ?? [{ state: "open", head: { sha: headSha }, number: 1 }]],
+    [/\/git\/ref\/heads\//, () => ({ object: { sha: tip } })],
+    [/\/compare\//, () => ({ status: compare })],
     [
       /\/pulls\/\d+$/,
       () => ({
         changed_files: changed === undefined ? files.length : changed,
         commits: nCommits === undefined ? commits.length : nCommits,
         head: { sha: headSha },
+        base: { ref: baseRef },
+        title,
       }),
     ],
   ];
@@ -156,6 +175,16 @@ describe("policy parsing", () => {
     assert.deepEqual(p.rules, [{ verdict: "docs", pattern: "*.md" }]);
   });
 
+  test("lint-title takes yes or no, and defaults to no", () => {
+    assert.equal(parsePolicy("docs *.md\nprefixes docs\n").lintTitle, true, "on by default");
+    assert.equal(parsePolicy("docs *.md\nprefixes docs\nlint-title yes\n").lintTitle, true);
+    assert.equal(parsePolicy("docs *.md\nprefixes docs\nlint-title no\n").lintTitle, false);
+    assert.throws(
+      () => parsePolicy("docs *.md\nprefixes docs\nlint-title maybe\n"),
+      /takes yes or no/,
+    );
+  });
+
   test("an unknown directive is refused, not skipped", () => {
     // A typo silently ignored is a policy that quietly does less than it
     // says -- and for a `code` rule that means excluded paths riding the lane.
@@ -209,6 +238,9 @@ describe("reading the policy", () => {
   });
 });
 
+// The light lane is a privilege, and an unverifiable retarget story is enough
+// to withhold it. Refusing at the gate instead would red a required check over
+// YAML this cannot parse; running the heavy jobs is never a lockout.
 describe("classify", () => {
   test("a markdown-only diff is docs", async () => {
     assert.equal(await classify(PR_ENV, POLICY, ctx({ files: named("README.md", "docs/DESIGN.md") })), true);
@@ -301,6 +333,64 @@ describe("binding a run to its own pull request", () => {
     ];
     const env = { event: "workflow_dispatch", pr: "1", sha: "headsha" };
     await assert.rejects(verifyDispatchBinding(env, ctx({ pulls: shared })), /cannot vouch for exactly one/);
+  });
+
+  test("a dispatch pins the base the CALLER carried forward, not a live read", async () => {
+    // The gate runs after the heavy jobs, so a base sampled here would settle
+    // against itself and agree whatever those jobs built against. Only the
+    // caller has a value from before them.
+    const env = { event: "workflow_dispatch", pr: "1", sha: "headsha", baseSha: "before-the-jobs" };
+    const pin = await verifyDispatchBinding(env, ctx({ tip: "moved-since" }));
+    assert.equal(pin.baseSha, "before-the-jobs");
+    const unbound = await verifyDispatchBinding({ ...env, baseSha: "" }, ctx({ tip: "moved-since" }));
+    assert.equal(unbound.baseSha, null, "absent must stay absent, not become a live read");
+  });
+});
+
+describe("a dispatched run needs a base recorded before it is measured", () => {
+  const green = {
+    event: "workflow_dispatch",
+    pr: "1",
+    sha: "headsha",
+    classifyResult: "success",
+    results: "check=success",
+  };
+  const pin = { head: "headsha", baseRef: "main", baseSha: null, title: null };
+
+  test("without one, the green is refused rather than certified", async () => {
+    await assert.rejects(gate(green, POLICY, ctx(), pin), /nothing records the base/);
+  });
+
+  test("with one, it settles like any other", async () => {
+    await gate(green, POLICY, ctx({ tip: "basetip" }), { ...pin, baseSha: "basetip" });
+  });
+
+  test("and a base that moved while the jobs ran is caught", async () => {
+    // The whole point of carrying it forward: this is invisible to a gate
+    // that reads the base itself.
+    await assert.rejects(
+      gate(green, POLICY, ctx({ tip: "moved-since" }), { ...pin, baseSha: "before-the-jobs" }),
+      /moved from before-the-jobs to moved-since/,
+    );
+  });
+
+  test("a dispatched SKIP needs one too", async () => {
+    // Missed at first on the reasoning that re-deriving the classification
+    // against the current base made a pin redundant. It does not: `classify`
+    // and `stillPinned` are separate reads, and a base advancing between them
+    // moves neither the head nor the base's NAME — the only two things
+    // settlement can otherwise compare — so the skip publishes for a diff
+    // measured against a base that has already gone.
+    const skipped = { ...green, results: "check=skipped" };
+    await assert.rejects(
+      gate(skipped, POLICY, ctx({ files: named("README.md") }), pin),
+      /nothing records the base/,
+    );
+  });
+
+  test("a push-event green with no pull request is untouched", async () => {
+    // The refusal is about a PR-bound dispatch, not about every pin-less run.
+    await gate({ ...green, event: "push", pr: "" }, POLICY, ctx(), null);
   });
 });
 
@@ -562,7 +652,7 @@ describe("the entry point", () => {
     assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
     // Exiting 0 proves nothing on its own -- an entry point that never ran
     // exits 0 too. The output is what proves it ran.
-    assert.equal(r.output, "docs_only=false\n");
+    assert.equal(r.output, "docs_only=false\nbase_sha=\n");
   });
 
   test("the whole classify path falls back to code, policy read included", () => {
@@ -572,7 +662,7 @@ describe("the entry point", () => {
     // run, and the gate is where that failure turns the check red.
     const r = runEntry({ INPUT_MODE: "classify", GITHUB_EVENT_NAME: "push" });
     assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-    assert.equal(r.output, "docs_only=false\n");
+    assert.equal(r.output, "docs_only=false\nbase_sha=\n");
     assert.match(r.stdout, /::warning::.*No lanes policy.*code lane/);
   });
 
@@ -584,7 +674,7 @@ describe("the entry point", () => {
     const env = { INPUT_PR: "1", GITHUB_EVENT_NAME: "pull_request", policy: "docs *.md\nprefixes docs\n" };
     const classified = runEntry({ ...env, INPUT_MODE: "classify" });
     assert.equal(classified.status, 0, `${classified.stdout}${classified.stderr}`);
-    assert.equal(classified.output, "docs_only=false\n");
+    assert.equal(classified.output, "docs_only=false\nbase_sha=\n");
     const gated = runEntry({ ...env, INPUT_MODE: "gate", INPUT_CLASSIFY_RESULT: "success", INPUT_RESULTS: "check=skipped" });
     assert.notEqual(gated.status, 0, `expected a refusal, got: ${gated.stdout}${gated.stderr}`);
     assert.match(gated.stdout, /::error::.*must not label another's commit/);
@@ -596,5 +686,319 @@ describe("the entry point", () => {
     const r = runEntry({ INPUT_MODE: "clasify", GITHUB_EVENT_NAME: "push", policy: "docs *.md\nprefixes docs\n" });
     assert.notEqual(r.status, 0, `expected a refusal, got: ${r.stdout}${r.stderr}`);
     assert.match(r.stdout, /::error::.*Unknown mode 'clasify'/);
+  });
+});
+
+// The time-of-check/time-of-use family. Every listing the engine makes
+// answers with the pull request's CURRENT state, while the check run it
+// produces lands on the commit the run STARTED from -- so each of these
+// covers a way those two can drift apart mid-run. `synchronize` and `edited`
+// start a fresh run but cancel nothing, so the stale run's verdict and the
+// replacement's land on the same commit with no ordering between them.
+describe("the event snapshot", () => {
+  const write = (payload) => {
+    const dir = mkdtempSync(join(tmpdir(), "lanes-event-"));
+    const file = join(dir, "event.json");
+    writeFileSync(file, JSON.stringify(payload));
+    return file;
+  };
+
+  test("comes from the payload, not from inputs a consumer could forget to wire", () => {
+    const path = write({
+      pull_request: { head: { sha: "abc" }, base: { ref: "topic", sha: "def" } },
+      repository: { default_branch: "main" },
+    });
+    assert.deepEqual(eventSnapshot({ GITHUB_EVENT_PATH: path }), {
+      head: "abc",
+      baseRef: "topic",
+      baseSha: "def",
+    });
+  });
+
+  test("is absent rather than invented when there is no payload", () => {
+    assert.equal(eventSnapshot({}), null);
+  });
+
+  test("an unreadable payload is refused, not treated as absent", () => {
+    // Absent and unreadable must not take the same branch: absent is a push
+    // or a dispatch, where there is no head/base pair to move, while
+    // unreadable is a pull_request run whose own trigger is unknown.
+    assert.throws(
+      () => eventSnapshot({ GITHUB_EVENT_PATH: "/nope/event.json" }),
+      /trigger cannot be established/,
+    );
+  });
+});
+
+describe("binding a run to the snapshot it was triggered for", () => {
+  const snap = (over = {}) => ({ head: "headsha", baseRef: "main", baseSha: "basesha", ...over });
+  const env = (over = {}) => ({ event: "pull_request", pr: "1", snapshot: snap(), ...over });
+
+  test("an unmoved pull request yields the pin the settlement will use", async () => {
+    assert.deepEqual(
+      await verifyEventBinding(env(), ctx({ files: named("README.md"), tip: "basesha" })),
+      { head: "headsha", baseRef: "main", baseSha: "basesha", title: null },
+    );
+  });
+
+  test("the pin records the EVENT's base commit, not the live tip", async () => {
+    // Two readers, two moments: the heavy jobs built against the base as it
+    // stood near the event, `changedPaths()` classifies against the tip when
+    // the gate runs. Pinning the tip guards the second and lets the first go
+    // stale; pinning the event's commit and demanding it still BE the tip at
+    // settlement is what makes them the same commit.
+    const pin = await verifyEventBinding(env(), ctx({ tip: "moved-on", compare: "ahead" }));
+    assert.equal(pin.baseSha, "basesha");
+  });
+
+  test("a head that moved after the event is refused", async () => {
+    // The heavy jobs validated the OLD merge snapshot; the replacement head's
+    // own run owns the verdict.
+    await assert.rejects(
+      verifyEventBinding(env(), ctx({ headSha: "newhead" })),
+      /head moved after this run's event/,
+    );
+  });
+
+  test("a retarget after the event is refused", async () => {
+    await assert.rejects(
+      verifyEventBinding(env(), ctx({ baseRef: "other" })),
+      /retargeted after this run's event/,
+    );
+  });
+
+  test("a base branch that was rewritten is refused", async () => {
+    // A force-push to the base moves this pull request's diff while head and
+    // base ref both stand still.
+    await assert.rejects(
+      verifyEventBinding(env(), ctx({ tip: "rewritten", compare: "diverged" })),
+      /base branch was rewritten after this run's event/,
+    );
+  });
+
+  test("a base branch that only advanced is not a rewrite", async () => {
+    // Asked by ancestry rather than by name: refusing every moved tip would
+    // fail every run straddling an unrelated merge, and exempting a branch
+    // for being the default one assumes a branch protection nobody promised.
+    const pin = await verifyEventBinding(env(), ctx({ tip: "moved-on", compare: "ahead" }));
+    assert.equal(pin.baseSha, "basesha");
+  });
+
+  test("a head shared with a twin pull request is refused", async () => {
+    await assert.rejects(
+      verifyEventBinding(
+        env(),
+        ctx({ pulls: [
+          { state: "open", head: { sha: "headsha" }, number: 1 },
+          { state: "open", head: { sha: "headsha" }, number: 2 },
+        ] }),
+      ),
+      /cannot vouch for exactly one/,
+    );
+  });
+
+  test("a payload missing ANY of the three fields is refused, not degraded", async () => {
+    // The base fields were optional, which made every guard below them
+    // conditional on data a `pull_request` payload always carries: a truncated
+    // one skipped the retarget check, skipped the rewrite check, and left
+    // `pin.baseSha` null so settlement never looked at the base at all — a
+    // green published for a snapshot nothing verified. A guard that switches
+    // itself off when its input is absent is not a guard.
+    for (const field of ["head", "baseRef", "baseSha"]) {
+      await assert.rejects(
+        verifyEventBinding(env({ snapshot: snap({ [field]: null }) }), ctx()),
+        new RegExp(`missing ${field}`),
+        field,
+      );
+    }
+  });
+
+  test("a non-pull_request event has no pin to take", async () => {
+    assert.equal(await verifyEventBinding({ event: "push", pr: "", snapshot: null }, ctx()), null);
+  });
+});
+
+describe("settling the pin after the reads the verdict rests on", () => {
+  const pin = (over = {}) => ({ head: "headsha", baseRef: "main", baseSha: null, title: null, ...over });
+
+  test("an unmoved pull request settles", async () => {
+    await stillPinned("1", pin(), POLICY, ctx());
+  });
+
+  test("a force-push landing mid-run is refused", async () => {
+    // `pulls` pinned to the OLD head so the twin check passes and the identity
+    // read — which now runs last, see stillPinned — is what refuses.
+    const moved = { headSha: "newhead", pulls: [{ state: "open", head: { sha: "headsha" }, number: 1 }] };
+    await assert.rejects(stillPinned("1", pin(), POLICY, ctx(moved)), /moved while the gate/);
+  });
+
+  test("a retarget landing mid-run is refused", async () => {
+    await assert.rejects(stillPinned("1", pin(), POLICY, ctx({ baseRef: "other" })), /moved while the gate/);
+  });
+
+  test("a base rewritten mid-run is refused", async () => {
+    await assert.rejects(
+      stillPinned("1", pin({ baseSha: "old" }), POLICY, ctx({ tip: "new", compare: "diverged" })),
+      /base branch moved from old to new/,
+    );
+  });
+
+  test("a base that merely ADVANCED mid-run is refused too", async () => {
+    // Ancestry is not enough here, on either verdict. `base...head` is
+    // measured from the merge base, so advancing the base into the head's own
+    // history drops commits from the diff rather than adding paths to it.
+    await assert.rejects(
+      stillPinned("1", pin({ baseSha: "old" }), POLICY, ctx({ tip: "new", compare: "ahead" })),
+      /moved from old to new/,
+    );
+  });
+
+  test("a base that stood still settles", async () => {
+    await stillPinned("1", pin({ baseSha: "basetip" }), POLICY, ctx());
+  });
+
+  test("a twin pull request appearing mid-run is refused", async () => {
+    await assert.rejects(
+      stillPinned("1", pin(), POLICY, ctx({ pulls: [
+        { state: "open", head: { sha: "headsha" }, number: 1 },
+        { state: "open", head: { sha: "headsha" }, number: 2 },
+      ] })),
+      /gained a second open pull request/,
+    );
+  });
+
+  test("a title that lost its prefix mid-run is refused", async () => {
+    await assert.rejects(
+      stillPinned("1", pin({ title: "docs: original" }), POLICY, ctx({ title: "Rewrite the guide" })),
+      /title lost its prefix/,
+    );
+  });
+
+  test("a benign retitle is not a move", async () => {
+    // Re-VALIDATED, not compared: the squash subject is just as honest after
+    // `docs: A` becomes `docs: B`, so failing the run would be a false alarm.
+    await stillPinned("1", pin({ title: "docs: original" }), POLICY, ctx({ title: "docs: a better name" }));
+  });
+
+  test("no pin means nothing to settle", async () => {
+    // A push-event gate reports on a branch, where there is no head/base pair
+    // to move -- so the absence of a pin must not be an error.
+    await stillPinned("1", null, POLICY, ctx({ headSha: "whatever" }));
+  });
+});
+
+describe("the all-green path settles too", () => {
+  const green = { ...PR_ENV, classifyResult: "success", results: "check=success" };
+  const pin = { head: "headsha", baseRef: "main", baseSha: null, title: null };
+
+  test("green results on an unmoved pull request report", async () => {
+    await gate(green, POLICY, ctx({ files: named("src/a.js") }), pin);
+  });
+
+  test("green results on a pull request that moved are refused", async () => {
+    // The heavy jobs really did pass -- for a snapshot the pull request no
+    // longer shows. Same failure as an unjustified skip, from the other side.
+    const moved = { headSha: "newhead", pulls: [{ state: "open", head: { sha: "headsha" }, number: 1 }] };
+    await assert.rejects(gate(green, POLICY, ctx(moved), pin), /moved while the gate/);
+  });
+
+  test("a base that fast-forwarded under a green build is refused", async () => {
+    // The heavy jobs built merge(head, base-at-the-event). Once the base
+    // moves, that is not the snapshot the pull request would land, so their
+    // success cannot vouch for it -- ancestry is not enough on this path.
+    await assert.rejects(
+      gate(green, POLICY, ctx({ tip: "advanced", compare: "ahead" }), { ...pin, baseSha: "basesha" }),
+      /moved from basesha to advanced/,
+    );
+  });
+
+  test("the same movement is refused under a SKIP too", async () => {
+    // A skip looks like the safe side of this -- a classification rather than
+    // evidence, with no path added by a fast-forward. It isn't: advancing the
+    // base INTO the head's history drops commits from the diff, so a head
+    // that changes code and then reverts it reads as documentation from the
+    // old base and as code from the new one.
+    const skip = { ...PR_ENV, classifyResult: "success", results: "check=skipped" };
+    await assert.rejects(
+      gate(
+        skip,
+        POLICY,
+        ctx({ files: named("README.md"), commits: [{ parents: [{}], commit: { message: "docs: x" } }], tip: "advanced", compare: "ahead" }),
+        { ...pin, baseSha: "basesha" },
+      ),
+      /moved from basesha to advanced/,
+    );
+  });
+
+  test("green results with no pin still report", async () => {
+    await gate(green, POLICY, ctx({ headSha: "whatever" }), null);
+  });
+});
+
+// Whether the title is a SUBJECT depends on how the consumer merges, so the
+// lint is opt-in. Under a squash it lands on the default branch; under a rebase
+// or a merge commit it never lands at all, and requiring a prefix on it fails a
+// pull request whose commits are all correctly prefixed.
+describe("the title is a subject too", () => {
+  const docs = { files: named("README.md"), commits: [{ parents: [{}], commit: { message: "docs: x" } }] };
+  const LINTED = parsePolicy("docs *.md\nprefixes docs test\n");
+  const OFF = parsePolicy("docs *.md\nprefixes docs test\nlint-title no\n");
+
+  test("a prefixed title passes the lint", async () => {
+    await lintPrefixes("1", LINTED, ctx({ ...docs, title: "docs: something" }));
+  });
+
+  test("a bare title fails it, because a squash merge lands that line", async () => {
+    await assert.rejects(
+      lintPrefixes("1", LINTED, ctx({ ...docs, title: "Rewrite the setup guide" })),
+      /title lacks a prefix/,
+    );
+  });
+
+  test("an empty title is refused rather than skipped", async () => {
+    await assert.rejects(lintPrefixes("1", LINTED, ctx({ ...docs, title: "" })), /no title to check/);
+  });
+
+  test("the judged title is recorded on the pin for settlement", async () => {
+    const pin = { head: "h", baseRef: "main", baseSha: null, title: null };
+    await lintPrefixes("1", LINTED, ctx({ ...docs, title: "docs: something" }), pin);
+    assert.equal(pin.title, "docs: something");
+  });
+
+  test("turned off, a bare title is nobody's business", async () => {
+    // The COMMITS still have to be prefixed — that is what guards what lands.
+    await lintPrefixes("1", OFF, ctx({ ...docs, title: "Rewrite the setup guide" }));
+    await assert.rejects(
+      lintPrefixes(
+        "1",
+        OFF,
+        ctx({ ...docs, commits: [{ parents: [{}], commit: { message: "Rewrite it" } }], title: "x" }),
+      ),
+      /commit subject lacks a prefix/,
+    );
+  });
+
+  test("and then the pin stays empty, so settlement re-validates nothing", async () => {
+    const pin = { head: "h", baseRef: "main", baseSha: null, title: null };
+    await lintPrefixes("1", OFF, ctx({ ...docs, title: "Rewrite the setup guide" }), pin);
+    assert.equal(pin.title, null);
+  });
+});
+
+describe("reading a base branch's tip", () => {
+  test("encodes each segment but keeps the separators", async () => {
+    const seen = [];
+    const spy = {
+      token: "t",
+      repo: "example/repo",
+      fetchImpl: async (url) => {
+        seen.push(new URL(url).pathname);
+        return { ok: true, status: 200, json: async () => ({ object: { sha: "s" } }), headers: { get: () => "" } };
+      },
+    };
+    // A `#` in a branch name would otherwise truncate the request to a
+    // different ref entirely, while the slashes are real separators.
+    await baseTip("feature/a#b", spy);
+    assert.match(seen[0], /\/git\/ref\/heads\/feature\/a%23b$/);
   });
 });
