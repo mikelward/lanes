@@ -12,7 +12,8 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, readFileSync, symlinkSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -405,5 +406,68 @@ describe("changedPaths", () => {
   test("returns both sides of a rename", async () => {
     const files = [{ filename: "b.md", previous_filename: "a.md" }, { filename: "c.md" }];
     assert.deepEqual(await changedPaths("1", ctx({ files, changed: 2 })), ["b.md", "a.md", "c.md"]);
+  });
+});
+
+describe("the entry point", () => {
+  // The bug this covers is a silent success: while `lanes.mjs` ended in
+  // `if (import.meta.url === `file://${process.argv[1]}`)`, a checkout under
+  // a path containing a space or a `#` percent-encoded on the URL side only,
+  // the comparison went false, `main()` was never called, and the process
+  // exited 0 -- the gate reporting green on a diff it had not read. So this
+  // runs the real file the manifest names, from exactly such a directory,
+  // and asserts both directions: a run that must fail exits non-zero, and a
+  // run that must succeed produces its output rather than merely exiting 0.
+  const entry = () => {
+    // The manifest is two flat keys under `runs:`; matching `main:` there is
+    // an approximation of YAML, so it also asserts there is exactly one.
+    const yml = readFileSync(new URL("./action.yml", import.meta.url), "utf8");
+    const hits = [...yml.matchAll(/^\s+main:\s*'([^']+)'\s*$/gm)].map((m) => m[1]);
+    assert.deepEqual(hits.length, 1, "action.yml should name exactly one entry point");
+    return hits[0];
+  };
+
+  /** Copy the engine into a hostile directory name and run the manifest's entry point. */
+  const runEntry = ({ policy, ...env }) => {
+    const root = mkdtempSync(join(tmpdir(), "lanes-"));
+    try {
+      // A space and a `#`: two characters a URL encodes and a path does not.
+      const checkout = join(root, "a b#c");
+      mkdirSync(join(checkout, ".github"), { recursive: true });
+      for (const f of ["lanes.mjs", entry()]) {
+        copyFileSync(new URL(`./${f}`, import.meta.url), join(checkout, f));
+      }
+      if (policy !== undefined) writeFileSync(join(checkout, POLICY_PATH), policy);
+      const out = join(root, "out");
+      writeFileSync(out, "");
+      const r = spawnSync(process.execPath, [join(checkout, entry())], {
+        cwd: checkout,
+        encoding: "utf8",
+        env: { PATH: process.env.PATH, GITHUB_OUTPUT: out, ...env },
+      });
+      return { ...r, output: readFileSync(out, "utf8") };
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  test("a run that must fail exits non-zero from a path with a space and a '#'", () => {
+    // No policy file, so the engine must refuse. Exit 0 here would be the
+    // silent-success shape: green having inspected nothing.
+    const r = runEntry({ INPUT_MODE: "gate", GITHUB_EVENT_NAME: "push" });
+    assert.notEqual(r.status, 0, `expected a refusal, got: ${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /::error::.*No lanes policy/);
+  });
+
+  test("a run that must succeed writes its output from the same path", () => {
+    const r = runEntry({
+      INPUT_MODE: "classify",
+      GITHUB_EVENT_NAME: "push",
+      policy: "docs *.md\nprefixes docs\n",
+    });
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    // Exiting 0 proves nothing on its own -- an entry point that never ran
+    // exits 0 too. The output is what proves it ran.
+    assert.equal(r.output, "docs_only=false\n");
   });
 });
