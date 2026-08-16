@@ -326,6 +326,14 @@ describe("the results input", () => {
     assert.throws(() => parseResults("check=success garbage"), /Malformed entry 'garbage'/);
   });
 
+  test("a repeated job name is refused", () => {
+    // Job IDs are unique, so a repeat is a copy-pasted line whose name was
+    // never changed -- and the job it should have named is the one now
+    // missing, whose failure the gate would never see.
+    assert.throws(() => parseResults("check=success check=success"), /appears twice/);
+    assert.throws(() => parseResults("check=success msrv=failure check=skipped"), /appears twice/);
+  });
+
   test("a result attributed to no job is refused", () => {
     // The other half of the vanished-job case: an empty NAME still counts
     // toward all-success, so the gate would report green having named no

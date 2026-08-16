@@ -443,6 +443,16 @@ export function parseResults(raw) {
   // job it was meant to name is the one now missing. Same family as the two
   // above: the input silently describes fewer jobs than the workflow has, and
   // the gate goes green having never seen the failing one's result.
+  const seen = new Set();
+  for (const { job } of parsed) {
+    if (seen.has(job)) {
+      throw new PolicyError(
+        `Job '${job}' appears twice in the results input — job IDs are unique, so a repeat is ` +
+          `a mistyped entry, and whichever job it should have named reported nothing.`,
+      );
+    }
+    seen.add(job);
+  }
   if (parsed.length === 0) {
     throw new PolicyError(
       `The results input named no heavy jobs — nothing reported, so there is nothing to pass. ` +
