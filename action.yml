@@ -1,7 +1,7 @@
 name: 'lanes'
 description: >-
-  Classify a pull request as docs or code, and gate the required check
-  on a skip that was actually justified.
+  Classify a pull request as docs or code, and gate the required check on a
+  skip that was actually justified.
 
 inputs:
   mode:
@@ -14,40 +14,23 @@ inputs:
   pr:
     description: >-
       The pull request number this run reports for. Empty on events that have
-      none, which classify treats as code — the safe direction. A dispatched
-      run that names none is refused outright unless the config allows it,
-      since nothing would bind the verdict to the commit it labels.
+      none, which classify treats as code -- the safe direction. A dispatched
+      run naming none is refused unless the policy allows it, since nothing
+      would bind the verdict to the commit it labels.
     required: false
     default: ''
-  config:
-    description: >-
-      Path to this repository's lane policy, relative to the checkout.
-
-      The policy is DATA -- parsed, never executed -- with one directive per
-      line: `docs <pattern>` and `code <pattern>` (ordered, first match wins,
-      anything unmatched is code), `prefixes <words>`, and optionally
-      `dispatch-without-pr refuse|allow`. Patterns are path-aware: `*` never
-      crosses `/`, so `*.md` is root markdown, `docs/*.md` is one level down,
-      and `**/` means zero or more segments. An unknown directive is an error.
-
-      A file rather than action inputs on purpose: both modes evaluate the
-      policy, and passing it per call site would put two copies in one
-      workflow, letting the gate re-derive under rules classify never used.
-    required: false
-    default: '.github/lanes.conf'
   classify-result:
     description: >-
       gate mode only. The classify job's result (needs.classify.result).
-      Anything but success means nothing vouches for this diff, and the gate
-      refuses.
+      Anything but success means nothing vouches for this diff.
     required: false
     default: ''
   results:
     description: >-
       gate mode only. Space-separated `job=result` pairs for every heavy job,
       e.g. "check=success msrv=skipped". Supplied by the caller so the engine
-      carries no per-repo job names. All success passes; all skipped passes
-      only if the lane is re-derived as justified; anything else fails.
+      carries no per-repo job names. An input naming NO jobs is refused rather
+      than passed: it would otherwise report green having been told nothing.
     required: false
     default: ''
   token:
@@ -62,54 +45,15 @@ outputs:
   docs_only:
     description: >-
       classify mode only. 'true' when every changed path is documentation by
-      the policy's rules and the verdict can be trusted, 'false' otherwise —
+      the policy's rules and the verdict can be trusted, 'false' otherwise --
       including every failure to establish it, so an unreadable diff runs the
       full lane.
-    value: ${{ steps.classify.outputs.docs_only }}
 
+# The policy lives at a FIXED path, `.github/lanes.conf`, and is not an input.
+# Making it configurable meant the engine had to work out which file it was
+# actually reading -- through symlinks, directory links, `..` segments and
+# absolute spellings -- and each of those was a way to change the rules while
+# the guard watched a different name. One name has none of them.
 runs:
-  using: 'composite'
-  steps:
-    # Every value below reaches the shell through `env:`, never through a
-    # `${{ }}` inside a `run:` body. GitHub substitutes an expression into the
-    # script *text* before bash parses it, so an input carrying a quote and a
-    # semicolon becomes shell source rather than shell data -- and a consumer
-    # forwarding an event field into `mode` is all it takes for that to be
-    # attacker-controlled. `env:` values are passed as data and never parsed
-    # as script, which is why even ACTION_PATH is bound here rather than
-    # interpolated: the rule is worth keeping absolute so no future edit has
-    # to re-derive which of these happen to be trusted today.
-    - name: Classify the diff
-      id: classify
-      if: inputs.mode == 'classify'
-      shell: bash
-      env:
-        ACTION_PATH: ${{ github.action_path }}
-        GH_TOKEN: ${{ inputs.token }}
-        PR: ${{ inputs.pr }}
-        LANES_CONFIG: ${{ inputs.config }}
-      run: '"$ACTION_PATH/lanes.sh" classify >> "$GITHUB_OUTPUT"'
-
-    - name: Verdict
-      if: inputs.mode == 'gate'
-      shell: bash
-      env:
-        ACTION_PATH: ${{ github.action_path }}
-        GH_TOKEN: ${{ inputs.token }}
-        PR: ${{ inputs.pr }}
-        LANES_CONFIG: ${{ inputs.config }}
-        CLASSIFY: ${{ inputs.classify-result }}
-        RESULTS: ${{ inputs.results }}
-      run: '"$ACTION_PATH/lanes.sh" gate'
-
-    # A mode neither step matched would otherwise be a silent success: the
-    # gate's step is skipped, the job goes green, and the required check
-    # reports a verdict nothing computed. Refuse instead.
-    - name: Reject an unknown mode
-      if: inputs.mode != 'classify' && inputs.mode != 'gate'
-      shell: bash
-      env:
-        MODE: ${{ inputs.mode }}
-      run: |
-        echo "::error::Unknown mode '${MODE}' — expected 'classify' or 'gate'."
-        exit 1
+  using: 'node24'
+  main: 'lanes.mjs'
