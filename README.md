@@ -235,8 +235,13 @@ is a stalled gate that a revert clears, not a forged verdict.
 ## No dependencies, on purpose
 
 Node's standard library, nothing else — no `package.json`, no lockfile, no
-build step. What consumers run is the file in this repository, which is what
-lets an unpinned `@main` reference be reviewed by reading it.
+build step. What consumers run is the source in this repository, which is what
+lets an unpinned `@main` reference be reviewed by reading it: `main.mjs` is the
+entry point the manifest names and does nothing but call into `lanes.mjs`,
+which defines and exports and never invokes. The two were one file, separated
+by an `import.meta.url === \`file://${process.argv[1]}\`` guard — a URL
+compared against a path, which differ under a checkout containing a space or a
+`#`, and the failure was the gate exiting 0 without reading the diff.
 `node --test lanes.test.mjs` runs the real engine against a stubbed API,
 asserting both directions of every behavior.
 

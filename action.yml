@@ -54,6 +54,10 @@ outputs:
 # actually reading -- through symlinks, directory links, `..` segments and
 # absolute spellings -- and each of those was a way to change the rules while
 # the guard watched a different name. One name has none of them.
+#
+# `main.mjs` is a thin entry point that calls into `lanes.mjs` unconditionally.
+# Pointing this at `lanes.mjs` instead would work only while that file carried
+# an is-this-the-entry-point guard, and such a guard failing reads as success.
 runs:
   using: 'node24'
-  main: 'lanes.mjs'
+  main: 'main.mjs'

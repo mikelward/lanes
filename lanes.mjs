@@ -417,7 +417,16 @@ export async function gate(env, policy, ctx) {
   await lintPrefixes(env.pr, policy, ctx);
 }
 
-// --- Entry point -----------------------------------------------------------
+// --- The run --------------------------------------------------------------
+//
+// This file defines and exports; it never invokes. `main.mjs` is what the
+// action manifest runs, and it invokes unconditionally. The two were one file
+// guarded by `import.meta.url === \`file://${process.argv[1]}\``, which is a
+// string comparison between a URL and a path: a checkout under a directory
+// with a space or a `#` in it encodes as `%20` / `%23` on one side and not
+// the other, the comparison goes false, `main()` never runs, and the process
+// exits 0 — the gate reporting green having inspected nothing. Nothing here
+// needs to know whether it was imported.
 
 export async function main(env = process.env) {
   // A JavaScript action receives its inputs as INPUT_<NAME>, uppercased with
@@ -455,11 +464,4 @@ export async function main(env = process.env) {
     return;
   }
   throw new PolicyError(`Unknown mode '${mode}' — expected 'classify' or 'gate'.`);
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((err) => {
-    process.stdout.write(`::error::${err.message}\n`);
-    process.exit(1);
-  });
 }
