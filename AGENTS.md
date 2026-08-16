@@ -5,7 +5,7 @@ Conventions for AI agents working in this repository.
 `CLAUDE.md` is a symlink to this file, so every agent reads the same
 conventions. Edit `AGENTS.md`.
 
-This repository is one GitHub Action: a shell engine that sorts a pull request
+This repository is one GitHub Action: an engine that sorts a pull request
 into a CI lane -- code or docs -- and a gate that re-derives that
 decision before a skip is allowed to count. Consumers track `@main`, so **a
 merge here reaches every consumer's required check on their next pull
@@ -32,10 +32,15 @@ has stopped biting.
 
 ## What this repository must not grow
 
-- **No dependencies beyond bash, coreutils and `gh`.** The runner supplies all
-  three. The engine is read by people deciding whether to trust it with a
-  required check, and an unpinned reference is only reviewable if reading the
-  files *is* reading what runs.
+- **No dependencies at all.** Node's standard library only: no `package.json`,
+  no lockfile, no build step. The engine is read by people deciding whether to
+  trust it with a required check, and an unpinned reference is only reviewable
+  if reading the files *is* reading what runs.
+- **Do not hand-roll a primitive the platform already has.** Glob matching and
+  path resolution were both written by hand here and both had to be removed:
+  between them they generated eight review findings, every one a case the
+  standard implementation handles. `path.matchesGlob` does the matching now,
+  and the policy path is fixed so there is no resolution to do.
 - **The gate must fail closed.** Every path that cannot prove a skip is
   justified — a truncated API response, a missing pull request, an
   unclassifiable file — refuses the skip rather than allowing it. A gate that
@@ -48,8 +53,8 @@ has stopped biting.
 
 ## Testing
 
-- `./lanes.test.sh`. No install step; it stubs `gh` and runs the real
-  engine against fixtures.
+- `node --test lanes.test.mjs`. No install step; it stubs the API and runs
+  the real engine against fixtures.
 - **Add or update tests with any change**, and assert **both directions** of
   every behavior — that a docs diff skips *and* that a code diff does
   not. This suite is the only thing between a push and every consumer's merge

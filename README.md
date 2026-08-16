@@ -35,6 +35,12 @@ Two jobs, plus a policy file.
 
 ### 1. The policy — `.github/lanes.conf`
 
+The path is fixed, and symlinks anywhere along it are refused. It is not an
+input: making it configurable meant working out which file was *actually*
+being read, and every route into that — a symlinked file, a symlinked
+directory, a link chain, a `..` segment, an absolute spelling — was a way to
+change the rules while the guard watched a different name.
+
 ```
 # Ordered: the FIRST matching rule wins, and anything matching no rule is code.
 code docs/REFERENCE.md    # compiled in by a test; see the trap below
@@ -49,9 +55,11 @@ prefixes design docs todo test build refactor
 dispatch-without-pr refuse
 ```
 
-**`*` never crosses `/`.** That is gitignore's rule, and it is the one thing
-here most likely to be assumed wrongly, because a bare shell `case` behaves
-the other way:
+**`*` never crosses `/`.** Matching is `path.matchesGlob`, Node's own, rather
+than anything written here — deliberately. The hand-rolled matcher this
+replaced cost three review rounds (`*` crossing `/`, `**/` failing to match
+zero segments, a mixed `a/**/b/**/c` combination), every one of which the
+standard implementation gets right without being asked:
 
 | pattern | matches |
 |---|---|
@@ -115,50 +123,36 @@ never reports on the docs lane, so nothing merges.
 `permissions: contents: read` and `pull-requests: read` are enough; the engine
 writes nothing.
 
-## Why the policy is data, and a file
+## Why the policy is data, and at a fixed path
 
-Both modes evaluate the policy. The gate's whole value is re-deriving the
-classification *independently, under the same rules* — it distrusts
-`classify`'s output, not `classify`'s policy. Passing the rules at each call
-site would put two copies in one workflow, and an edit to one copy would leave
-the gate re-deriving under rules `classify` never used: a required check
-reporting green on validation it did not perform.
-
-A file is one copy by construction.
+Both modes evaluate the policy. `gate`'s value is re-deriving the
+classification **independently, under the same rules** — it distrusts
+`classify`'s *output*, not `classify`'s *policy*. A file is one copy by
+construction; rules passed at each call site would be two copies in one
+workflow, and an edit to one would leave the gate re-deriving under rules
+`classify` never used.
 
 **The policy never executes.** It is parsed as data, and that is the whole of
-the trust story.
+the trust story. It began as a sourced shell file, which took four review
+rounds to establish was indefensible: on a `pull_request` event the checkout
+is the merge ref, so the file is the *pull request's* copy — and a sourced
+file **is** the shell. It controlled the engine's argv (a config holding
+`set -- classify` made `gate` run the classify arm and exit 0 without reading
+its inputs), the environment read afterwards, `PATH`, and even the API client.
 
-It began as a sourced shell file, which took four review rounds to establish
-was indefensible. On a `pull_request` event the checkout is the merge ref, so
-the file is the *pull request's* copy — and a sourced file **is** the shell.
-It controlled the positional parameters (a config holding `set -- classify`
-made `lanes.sh gate` run the classify arm and exit 0 without ever reading its
-inputs — the required check green over failed jobs), the environment read
-afterwards, `PATH`, and a `gh()` function shadowing every API call the
-classification rests on. Isolating it in a subshell fixed the reach into
-engine state and none of the rest, since a subshell still inherits the token,
-the network and a writable disk.
+**The path is fixed and symlinks are refused**, so there is nothing to
+resolve. That replaced five review rounds of resolution logic, all of it
+defending a knob nobody had asked for.
 
-Each of those was a different name for one mistake: letting it run at all.
-Patterns are matched with `case`, which expands a pattern word once and does
-not re-scan a variable's value — so `$(...)` inside a rule is inert text. The
-suite asserts that by planting one and checking nothing happened.
+**And the engine, not the policy, decides that the policy file is code.**
+Asking the policy whether edits to the policy need review lets a pull request
+answer the one question its answer must not decide — and the gate would agree,
+being independent of `classify`'s output but not of the rules they share.
 
-**And the engine, not the policy, decides that the policy file is code.** On a
-`pull_request` event the checkout is the pull request's merge ref, so the
-config sourced is the *pull request's* copy — and asking it whether edits to
-itself are documentation would let a pull request answer the one question its
-answer must not decide. A config returning docs for itself and for the source
-files beside it would skip the heavy jobs, and the gate would agree, because
-the gate is independent of `classify`'s **output** but not of the **policy**
-they share. So a diff touching the configured policy path classifies as code
-unconditionally, whatever `is_docs` says, on both sides of a rename.
-
-A config that cannot supply a policy is refused rather than defaulted: a
-missing file, one defining no `is_docs`, or one with an empty
-`LANE_PREFIXES` all fail loudly. Defaulting would look like the safe direction
-— full lane forever — while hiding a broken config indefinitely.
+A policy that cannot supply rules is **refused, not defaulted**: a missing
+file, no rules, no prefixes, an unknown directive. Defaulting would look like
+the safe direction — full lane forever — while hiding a broken config
+indefinitely.
 
 ## Writing your policy
 
@@ -240,10 +234,11 @@ is a stalled gate that a revert clears, not a forged verdict.
 
 ## No dependencies, on purpose
 
-Bash, coreutils and `gh` — all three already on the runner. No build step and
-nothing generated, so what consumers run is what a reader reads. `./lanes.test.sh`
-runs the real engine against a stubbed `gh`, asserting both directions of every
-behavior, and CI lints it at full shellcheck severity.
+Node's standard library, nothing else — no `package.json`, no lockfile, no
+build step. What consumers run is the file in this repository, which is what
+lets an unpinned `@main` reference be reviewed by reading it.
+`node --test lanes.test.mjs` runs the real engine against a stubbed API,
+asserting both directions of every behavior.
 
 ## License
 

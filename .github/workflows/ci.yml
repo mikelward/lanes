@@ -7,8 +7,8 @@ name: CI
 # catch anything. The `push` run below re-checks the commit the merge produced.
 #
 # This repository deliberately does NOT ride its own lane. The lane exists to
-# skip heavy jobs, and there are none here -- the whole suite is a few seconds
-# of bash -- so classify plus gate would add two jobs and a required check to
+# skip heavy jobs, and there are none here -- the suite is a fraction of a
+# second -- so classify plus gate would add two jobs and a required check to
 # save nothing. A consumer with a real build is where it pays.
 on:
   push:
@@ -28,13 +28,13 @@ jobs:
         with:
           persist-credentials: false
 
-      # The engine ships as text and runs on whatever bash the consumer's
-      # runner has, so a shell bug reaches every consumer with nothing between
-      # it and their merge gate.
-      - name: Lint
-        run: shellcheck lanes.sh lanes.test.sh
+      # The major the action manifest declares. `path.matchesGlob` is what
+      # this engine leans on rather than hand-rolling a matcher, so the
+      # runtime that provides it is not incidental.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
 
-      # Runs the real engine against a stubbed `gh`, both directions per
-      # behavior. No install step -- there is nothing to install.
+      # No install step, because there is nothing to install.
       - name: Test
-        run: ./lanes.test.sh
+        run: node --test lanes.test.mjs
