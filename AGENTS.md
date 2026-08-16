@@ -6,7 +6,7 @@ Conventions for AI agents working in this repository.
 conventions. Edit `AGENTS.md`.
 
 This repository is one GitHub Action: a shell engine that sorts a pull request
-into a CI lane -- code or housekeeping -- and a gate that re-derives that
+into a CI lane -- code or docs -- and a gate that re-derives that
 decision before a skip is allowed to count. Consumers track `@main`, so **a
 merge here reaches every consumer's required check on their next pull
 request, with no release step in between.** Everything below follows from that.
@@ -20,7 +20,7 @@ has stopped biting.
 ## What this repository is for
 
 - **The engine is shared; the policy is not.** A consumer supplies its own
-  config — which paths are housekeeping, which commit-subject prefixes the lane
+  config — which paths are docs, which commit-subject prefixes the lane
   accepts, whether a dispatched run without a pull request is legitimate — and
   nothing else. Everything a consumer would have to think about twice belongs
   here; everything that differs between repositories belongs there.
@@ -51,7 +51,7 @@ has stopped biting.
 - `./lanes.test.sh`. No install step; it stubs `gh` and runs the real
   engine against fixtures.
 - **Add or update tests with any change**, and assert **both directions** of
-  every behavior — that a housekeeping diff skips *and* that a code diff does
+  every behavior — that a docs diff skips *and* that a code diff does
   not. This suite is the only thing between a push and every consumer's merge
   gate, so a change that ships untested ships unreviewed.
 - The suite's failure mode is a *false pass*: a fixture that stops reaching the

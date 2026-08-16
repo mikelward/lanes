@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Two CI lanes: lets housekeeping-only pull requests merge without the
+# Two CI lanes: lets docs-only pull requests merge without the
 # heavy jobs, while one required check — the `gate` mode — still reports on
 # every pull request.
 #
 # Why this exists: a ruleset can only require named checks, and a required
 # check that never reports blocks the pull request forever. A `paths:` filter
-# on `pull_request` skips the whole workflow for housekeeping diffs, which is
+# on `pull_request` skips the whole workflow for docs-only diffs, which is
 # exactly that trap. So the workflow runs on every pull request; `classify`
 # decides whether the heavy jobs may skip, and `gate` — the only mode a
 # ruleset should require — independently re-derives that decision before
@@ -13,7 +13,7 @@
 # a silent merge.
 #
 # One source of truth: both modes run THIS file against the SAME config, so
-# the housekeeping rule cannot drift between them. What the gate adds is
+# the docs rule cannot drift between them. What the gate adds is
 # re-execution plus a cross-check against what actually ran.
 set -euo pipefail
 
@@ -31,7 +31,7 @@ set -euo pipefail
 # so a pull request that edits the lane's own rules classifies as code and
 # runs the full heavy lane before anything can act on the new rules.
 #
-# The config defines is_housekeeping() and LANE_PREFIXES, and may override
+# The config defines is_docs() and LANE_PREFIXES, and may override
 # dispatch_without_pr_ok(). Everything else is engine.
 
 # Default: refuse a dispatched run that names no pull request. A repo whose
@@ -50,11 +50,11 @@ fi
 . "$LANES_CONFIG"
 
 # A config that loaded but defined nothing would leave the engine with no
-# policy at all, and "no policy" must never read as "nothing is housekeeping"
+# policy at all, and "no policy" must never read as "nothing is docs"
 # — that is a silent full-lane forever, which looks like the safe direction
 # but hides a broken config indefinitely. Refuse instead.
-if ! declare -F is_housekeeping >/dev/null; then
-  echo "::error::${LANES_CONFIG} defines no is_housekeeping() — refusing to classify without a path policy." >&2
+if ! declare -F is_docs >/dev/null; then
+  echo "::error::${LANES_CONFIG} defines no is_docs() — refusing to classify without a path policy." >&2
   exit 1
 fi
 if [ -z "${LANE_PREFIXES:-}" ]; then
@@ -127,7 +127,7 @@ open_prs_heading() {
     --jq '.[] | select(.state == "open" and .head.sha == env.HEAD_Q) | .number'
 }
 
-# 0 = every changed file is housekeeping; 1 = code, or an empty diff;
+# 0 = every changed file is docs; 1 = code, or an empty diff;
 # 2 = the file list could not be trusted (API failure or truncation).
 docs_only() {
   case "${GITHUB_EVENT_NAME:-}" in
@@ -161,15 +161,15 @@ docs_only() {
   while IFS=$'\t' read -r new old; do
     test -n "$new" || continue
     any=true
-    is_housekeeping "$new" || return 1
-    # A rename is only housekeeping if the path it LEFT was housekeeping too.
-    if [ -n "$old" ]; then is_housekeeping "$old" || return 1; fi
+    is_docs "$new" || return 1
+    # A rename is only docs if the path it LEFT was docs too.
+    if [ -n "$old" ]; then is_docs "$old" || return 1; fi
   done <<< "$files"
   # An empty diff is not a docs diff; refuse to vouch for it.
   test "$any" = true
 }
 
-# On the docs lane every commit subject must carry a housekeeping prefix. A
+# On the docs lane every commit subject must carry a docs-lane prefix. A
 # commits listing that cannot be completed fails the lint — an unverified
 # prefix is not a verified one.
 lint_prefixes() {
@@ -208,7 +208,7 @@ lint_prefixes() {
     if has_lane_prefix "$subject"; then continue; fi
     local list="" p
     for p in $LANE_PREFIXES; do list="${list}${p}:/"; done
-    echo "::error::Housekeeping-lane commit subject lacks a prefix:" \
+    echo "::error::Docs-lane commit subject lacks a prefix:" \
          "'${subject}' — prefix it (${list%/})" \
          "so it never reads like a behavior-change subject."
     bad=1
@@ -222,7 +222,7 @@ lint_prefixes() {
 # event's fact — and the rest of this engine then reasons entirely about
 # whichever pull request that claim points at. A consumer that miswires it
 # (a hard-coded number, a copy-pasted expression naming the wrong event
-# field) makes both modes inspect pull request B, find B housekeeping, skip
+# field) makes both modes inspect pull request B, find B docs-only, skip
 # the heavy jobs, and hang a green gate on code pull request A's commit.
 # Every downstream guard here is about which commits a PR heads; none of them
 # notices that the PR under examination is the wrong one.
@@ -326,7 +326,7 @@ case "${1:?usage: lanes.sh classify|gate}" in
       # docs_only's failure modes (code file, truncated or unlistable file
       # list) all land here as a refusal.
       if ! docs_only; then
-        echo "::error::Heavy jobs were skipped but the diff could not be verified as housekeeping-only — refusing the skip."
+        echo "::error::Heavy jobs were skipped but the diff could not be verified as docs-only — refusing the skip."
         exit 1
       fi
       lint_prefixes
