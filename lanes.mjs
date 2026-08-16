@@ -365,6 +365,15 @@ export function parseResults(raw) {
     }
     const job = pair.slice(0, at);
     const result = pair.slice(at + 1);
+    // BOTH sides. An empty result is a job that vanished; an empty NAME is a
+    // result attributed to nothing, which counts toward all-success and turns
+    // the required check green having named no heavy job at all -- the same
+    // shape as an input of pure whitespace, one layer in.
+    if (!job) {
+      throw new PolicyError(
+        `Entry '${pair}' in the results input names no job — a result has to say what reported it.`,
+      );
+    }
     if (!result) {
       throw new PolicyError(
         `Job '${job}' reported no result — it was probably renamed or removed ` +

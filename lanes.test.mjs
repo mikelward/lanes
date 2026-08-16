@@ -323,6 +323,14 @@ describe("the results input", () => {
   test("a token with no = is refused", () => {
     assert.throws(() => parseResults("check=success garbage"), /Malformed entry 'garbage'/);
   });
+
+  test("a result attributed to no job is refused", () => {
+    // The other half of the vanished-job case: an empty NAME still counts
+    // toward all-success, so the gate would report green having named no
+    // heavy job -- the whitespace failure one layer in.
+    assert.throws(() => parseResults("=success"), /names no job/);
+    assert.throws(() => parseResults("check=success =skipped"), /names no job/);
+  });
 });
 
 describe("gate", () => {
