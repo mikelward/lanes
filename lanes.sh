@@ -64,6 +64,22 @@ fi
 
 # --- Engine ----------------------------------------------------------------
 
+# Non-empty lines in a block, counted without grep.
+#
+# `grep -c .` needs a `|| true` because it exits 1 on zero matches -- and that
+# `|| true` would equally swallow a command-not-found, turning a missing
+# dependency into an empty count and a comparison that is malformed rather
+# than wrong-but-loud. Counting in the shell has no failure mode to mask, and
+# drops grep from the classification path entirely.
+count_lines() {
+  local n=0 line
+  while IFS= read -r line; do
+    if [ -n "$line" ]; then n=$((n + 1)); fi
+  done <<< "$1"
+  printf '%s' "$n"
+}
+
+
 has_lane_prefix() {
   local subject=$1 p
   for p in $LANE_PREFIXES; do
@@ -95,7 +111,7 @@ pr_files() {
     echo "::error::Could not list the pull request's files." >&2
     return 1
   }
-  listed=$(printf '%s' "$files" | grep -c . || true)
+  listed=$(count_lines "$files")
   if [ "$listed" -ne "$declared" ]; then
     echo "::error::File list incomplete: listed ${listed} of ${declared} changed files (the API caps at 3,000) — refusing to classify." >&2
     return 1
@@ -131,7 +147,7 @@ docs_only() {
       # The sole open PR must be THIS one, not merely a count of one: the
       # originating PR can close while its run is in flight, leaving a
       # stacked twin as the single open PR the gate would then vouch for.
-      if [ "$(printf '%s' "$prs" | grep -c .)" -ne 1 ] || [ "$(printf '%s' "$prs" | head -n1)" != "$PR" ]; then return 1; fi
+      if [ "$(count_lines "$prs")" -ne 1 ] || [ "${prs%%$'\n'*}" != "$PR" ]; then return 1; fi
       ;;
     # A dispatched run may stand in for a PR run, but only by naming the PR,
     # so classification still judges the PR's real diff rather than waving
@@ -178,7 +194,7 @@ lint_prefixes() {
     echo "::error::Commit enumeration returned nothing — the prefix rule cannot be verified."
     return 1
   fi
-  listed=$(printf '%s' "$subjects" | grep -c . || true)
+  listed=$(count_lines "$subjects")
   if [ "$listed" -ne "$declared" ]; then
     echo "::error::Commit list incomplete: listed ${listed} of ${declared} commits (the API caps at 250) — the prefix rule cannot be verified."
     return 1
@@ -190,16 +206,42 @@ lint_prefixes() {
     # than one parent, not one whose subject happens to start with the word.
     if [ "${parents:-1}" -gt 1 ]; then continue; fi
     if has_lane_prefix "$subject"; then continue; fi
-    # SC2086: LANE_PREFIXES is a space-separated list and the splitting is the
-    # point — one `%s:/` per prefix. Quoting it prints the whole list as a
-    # single mangled token.
-    # shellcheck disable=SC2086
+    local list="" p
+    for p in $LANE_PREFIXES; do list="${list}${p}:/"; done
     echo "::error::Housekeeping-lane commit subject lacks a prefix:" \
-         "'${subject}' — prefix it ($(printf '%s:/' $LANE_PREFIXES | sed 's,/$,,'))" \
+         "'${subject}' — prefix it (${list%/})" \
          "so it never reads like a behavior-change subject."
     bad=1
   done <<< "$subjects"
   return "$bad"
+}
+
+# On a pull_request run the named PR must BE the one that triggered it.
+#
+# The number arrives as an input, so it is the caller's *claim*, not the
+# event's fact — and the rest of this engine then reasons entirely about
+# whichever pull request that claim points at. A consumer that miswires it
+# (a hard-coded number, a copy-pasted expression naming the wrong event
+# field) makes both modes inspect pull request B, find B housekeeping, skip
+# the heavy jobs, and hang a green gate on code pull request A's commit.
+# Every downstream guard here is about which commits a PR heads; none of them
+# notices that the PR under examination is the wrong one.
+#
+# GITHUB_REF settles it without a JSON parse: on a pull_request event GitHub
+# sets it to refs/pull/<n>/merge, which is the event's own statement of which
+# pull request this run belongs to. Unset or unparsable is refused rather
+# than waved through — the fail-closed direction, matching the dispatch
+# binding below.
+verify_pr_binding() {
+  test "${GITHUB_EVENT_NAME:-}" = "pull_request" || return 0
+  # No claim to check. docs_only classifies a PR-less run as code, so the
+  # full lane runs and there is nothing to bind.
+  test -n "${PR:-}" || return 0
+  case "${GITHUB_REF:-}" in
+    refs/pull/"$PR"/*) return 0 ;;
+  esac
+  echo "::error::The pr input names #${PR}, but this run belongs to '${GITHUB_REF:-<unset>}' — a verdict computed for one pull request must not label another's commit."
+  return 1
 }
 
 # On a dispatched run the named PR must BE the checked-out commit: `--ref`
@@ -241,7 +283,7 @@ verify_dispatch_binding() {
     echo "::error::Could not list the pull requests this commit heads — refusing to report for it."
     return 1
   }
-  if [ "$(printf '%s' "$heads" | grep -c .)" -ne 1 ] || [ "$(printf '%s' "$heads" | head -n1)" != "$PR" ]; then
+  if [ "$(count_lines "$heads")" -ne 1 ] || [ "${heads%%$'\n'*}" != "$PR" ]; then
     echo "::error::Commit ${GITHUB_SHA} heads these open pull requests: $(printf '%s' "$heads" | tr '\n' ' ')— a per-commit gate cannot vouch for exactly one, so a dispatched run refuses to report."
     return 1
   fi
@@ -249,6 +291,7 @@ verify_dispatch_binding() {
 
 case "${1:?usage: lanes.sh classify|gate}" in
   classify)
+    verify_pr_binding || exit 1
     verify_dispatch_binding || exit 1
     # Any failure to establish docs-only — code paths, an untrustworthy file
     # list, a non-PR event — classifies as code: the heavy jobs run, which is
@@ -256,6 +299,7 @@ case "${1:?usage: lanes.sh classify|gate}" in
     if docs_only; then echo "docs_only=true"; else echo "docs_only=false"; fi
     ;;
   gate)
+    verify_pr_binding || exit 1
     verify_dispatch_binding || exit 1
     # Results arrive via env: CLASSIFY (needs.classify.result) and RESULTS —
     # space-separated `job=result` pairs for every heavy job, supplied by the

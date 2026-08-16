@@ -101,6 +101,7 @@ EOF
 
 export PATH="$stub:$PATH" GITHUB_REPOSITORY=example/repo PR=1 \
        GITHUB_EVENT_NAME=pull_request GITHUB_SHA=headsha \
+       GITHUB_REF=refs/pull/1/merge \
        LANES_CONFIG="$stub/default.conf"
 
 fails=0
@@ -143,6 +144,18 @@ check "a config with no rule is refused"  1 "no is_housekeeping" FILES="README.m
 check "a config with no prefixes refused"  1 "no LANE_PREFIXES" FILES="README.md" LANES_CONFIG="$stub/noprefix.conf"
 MODE=sniff
 check "an unknown mode is refused"        2 "unknown mode" FILES="README.md"
+MODE=classify
+
+# --- the pr input must name the run's own pull request
+# The number is the caller's claim, not the event's fact. Without this, a
+# miswired consumer classifies PR B and hangs B's clean verdict on A's commit.
+check "the triggering PR classifies normally"  0 "docs_only=true"  FILES="README.md"
+check "a pr naming another PR is refused"      1 "belongs to" FILES="README.md" PR=2 GITHUB_REF=refs/pull/1/merge SHARED_PRS=2
+check "an unset ref is refused, not waved through" 1 "belongs to" FILES="README.md" GITHUB_REF=
+check "a non-PR ref is refused"                1 "belongs to" FILES="README.md" GITHUB_REF=refs/heads/main
+check "a prefix collision is not a match"      1 "belongs to" FILES="README.md" PR=1 GITHUB_REF=refs/pull/11/merge
+MODE=gate
+check "the gate refuses a mis-named pr too"    1 "belongs to" FILES="README.md" SUBJECTS="docs: x" CLASSIFY=success RESULTS="a=skipped" PR=2 GITHUB_REF=refs/pull/1/merge SHARED_PRS=2
 MODE=classify
 
 # --- classify: the rule itself, both directions per shape
@@ -197,6 +210,73 @@ check "red job fails the gate"            1 "not all green" FILES="a.rs" CLASSIF
 check "half-skipped is not justified"     1 "not all green" FILES="a.rs" CLASSIFY=success RESULTS="check=skipped msrv=success"
 check "canceled job fails the gate"       1 "not all green" FILES="a.rs" CLASSIFY=success RESULTS="check=cancelled msrv=cancelled"
 check "failed classify fails the gate"    1 "nothing vouches" FILES="a.rs" CLASSIFY=failure RESULTS="$ALLSKIP"
+
+# --- action.yml: no expression may reach a shell as script text
+#
+# GitHub substitutes ${{ }} into a `run:` body before bash parses it, so an
+# interpolated input becomes shell SOURCE rather than shell DATA -- a value
+# like `x"; exit 0; #` ends the quoted argument and the fixed `exit 1` below
+# it never runs. Binding through `env:` passes the value as data instead.
+#
+# Asserted as a whole-file property rather than by hunting for the known bad
+# spellings: every line carrying an expression must BE an env binding. A new
+# step that interpolates anywhere else fails here, in whatever notation, and
+# has to be rewritten rather than remembered.
+manifest_dir=$(cd "$here" && pwd)
+bad_interp=0
+in_runs=0
+# SC2016: the single quotes are the point -- these patterns match the literal
+# characters `${{`, which must not expand in the one check whose job is to
+# find them unexpanded.
+# shellcheck disable=SC2016
+while IFS= read -r line; do
+  case "$line" in
+    "runs:") in_runs=1; continue ;;
+  esac
+  test "$in_runs" = 1 || continue
+  # Comment lines are skipped: this manifest has to be able to *discuss*
+  # ${{ }} in the note explaining why it never uses one, and a check that
+  # cannot tell directive from prose fires on its own documentation.
+  case "${line#"${line%%[![:space:]]*}"}" in
+    '#'*) continue ;;
+  esac
+  case "$line" in
+    *'${{'*) ;;
+    *) continue ;;
+  esac
+  # The only permitted shape: an env binding whose whole value is one
+  # expression, e.g. `        PR: ${{ inputs.pr }}`.
+  case "$line" in
+    *[!\ ]*:\ '${{ '*' }}') ;;
+    *) echo "FAIL: action.yml interpolates outside an env binding: $line"; bad_interp=1 ;;
+  esac
+done < "$manifest_dir/action.yml"
+if [ "$bad_interp" -eq 0 ]; then
+  echo "ok: action.yml passes every expression through env, never into script text"
+else
+  fails=1
+fi
+
+# Prove the check above can actually fail -- an assertion that never fires on
+# a bad input is a green light nobody earned.
+# shellcheck disable=SC2016
+probe=$(printf 'runs:\n  steps:\n    - run: echo "${{ inputs.mode }}"\n')
+# shellcheck disable=SC2016
+if printf '%s\n' "$probe" | {
+     seen=0; inr=0
+     while IFS= read -r l; do
+       case "$l" in "runs:") inr=1; continue ;; esac
+       test "$inr" = 1 || continue
+       case "$l" in *'${{'*) ;; *) continue ;; esac
+       case "$l" in *[!\ ]*:\ '${{ '*' }}') ;; *) seen=1 ;; esac
+     done
+     test "$seen" = 1
+   }; then
+  echo "ok: the interpolation check rejects a run: body that interpolates"
+else
+  echo "FAIL: the interpolation check passed a known-bad manifest"
+  fails=1
+fi
 
 rm -rf "$stub"
 if [ "$fails" -ne 0 ]; then echo "lanes tests FAILED"; exit 1; fi
