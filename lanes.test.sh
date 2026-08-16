@@ -60,14 +60,10 @@ chmod +x "$stub/gh"
 # exercise an ordered rule (a crate tree wins over the markdown arm) rather
 # than a single pattern that could not tell ordering bugs apart.
 cat > "$stub/default.conf" <<'EOF'
-is_docs() {
-  case "$1" in
-    crates/*) return 1 ;;
-    *.md) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-LANE_PREFIXES="design docs todo test build refactor"
+code crates/**
+docs *.md
+docs docs/*.md
+prefixes design docs todo test build refactor
 EOF
 
 # A deliberately different policy, used only to prove the config is
@@ -75,13 +71,8 @@ EOF
 # engine that ignored the config and hard-coded the default one -- the exact
 # false pass this file exists to prevent.
 cat > "$stub/other.conf" <<'EOF'
-is_docs() {
-  case "$1" in
-    *.txt) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-LANE_PREFIXES="notes"
+docs *.txt
+prefixes notes
 EOF
 
 # A config that loads but declares no policy, and one that declares paths but
@@ -89,43 +80,41 @@ EOF
 # docs" / "no subject can pass".
 : > "$stub/empty.conf"
 cat > "$stub/noprefix.conf" <<'EOF'
-is_docs() { return 0; }
+docs **
 EOF
 
 # A policy that claims everything is documentation, itself included. This is
 # what a pull request would ship to buy its own skip, so the engine's refusal
 # has to hold against it rather than against a well-behaved config.
 cat > "$stub/hostile.conf" <<'EOF'
-is_docs() { return 0; }
-LANE_PREFIXES="docs"
+docs **
+prefixes docs
 EOF
 
-# Configs that try to escape into the engine rather than merely lie to it.
-# A sourced file IS the shell, so these are the shapes a path guard cannot
-# see: argv, the environment the engine reads later, and the API client
-# itself.
-cat > "$stub/escape-argv.conf" <<'EOF'
-is_docs() { return 1; }
-LANE_PREFIXES="docs"
+# A config carrying shell. It is data now, so `set` is simply an unknown
+# directive -- refused, not run. The file it would have hijacked is the same
+# one that used to source it.
+cat > "$stub/shellish.conf" <<'EOF'
+docs *.md
+prefixes docs
 set -- classify
 EOF
-cat > "$stub/escape-env.conf" <<'EOF'
-is_docs() { return 1; }
-LANE_PREFIXES="docs"
-CLASSIFY=success
-RESULTS="everything=success"
-EOF
-cat > "$stub/escape-gh.conf" <<'EOF'
-is_docs() { return 0; }
-LANE_PREFIXES="docs"
-gh() { echo 0; }
+
+# A rule whose pattern LOOKS like a command substitution. `case` expands a
+# pattern word once and does not re-scan a variable's value, so this is inert
+# text -- asserted rather than assumed, since it is the claim the whole
+# data-only design rests on.
+cat > "$stub/inert.conf" <<'EOF'
+docs $(touch /tmp/lanes-pwned)
+docs *.md
+prefixes docs
 EOF
 
 # A config that allows a dispatched run with no pull request.
 cat > "$stub/dispatch-ok.conf" <<'EOF'
-is_docs() { case "$1" in *.md) return 0 ;; *) return 1 ;; esac; }
-LANE_PREFIXES="docs"
-dispatch_without_pr_ok() { return 0; }
+docs *.md
+prefixes docs
+dispatch-without-pr allow
 EOF
 
 export PATH="$stub:$PATH" GITHUB_REPOSITORY=example/repo PR=1 \
@@ -169,8 +158,8 @@ MODE=classify
 
 # --- a config that cannot supply a policy is refused, never defaulted
 check "a missing config is refused"      1 "No lanes config" FILES="README.md" LANES_CONFIG="$stub/nope.conf"
-check "a config with no rule is refused"  1 "no is_docs" FILES="README.md" LANES_CONFIG="$stub/empty.conf"
-check "a config with no prefixes refused"  1 "no LANE_PREFIXES" FILES="README.md" LANES_CONFIG="$stub/noprefix.conf"
+check "a config with no rule is refused"  1 "declares no docs or code rules" FILES="README.md" LANES_CONFIG="$stub/empty.conf"
+check "a config with no prefixes refused"  1 "sets no prefixes" FILES="README.md" LANES_CONFIG="$stub/noprefix.conf"
 MODE=sniff
 check "an unknown mode is refused"        2 "unknown mode" FILES="README.md"
 MODE=classify
@@ -207,20 +196,23 @@ MODE=gate
 check "the gate refuses a policy-edit skip"    1 "refusing the skip" FILES="$stub/hostile.conf" SUBJECTS="docs: x" CLASSIFY=success RESULTS="a=skipped" LANES_CONFIG="$stub/hostile.conf"
 MODE=classify
 
-# --- the policy never reaches this shell
-# `set -- classify` once made `lanes.sh gate` run the classify arm and exit 0
-# without reading CLASSIFY or RESULTS at all: the required check green over
-# failed heavy jobs. Each of these is a different reach out of the policy and
-# into the engine, and each must fail closed rather than be defended by name.
+# --- the policy is data, so there is nothing to escape from
+# `set -- classify` in a sourced config once made `lanes.sh gate` run the
+# classify arm and exit 0 without reading CLASSIFY or RESULTS. As data it is
+# an unknown directive and the run refuses outright.
 MODE=gate
-check "argv cannot be rewritten by the policy"  1 "" FILES="src/main.rs" CLASSIFY=failure RESULTS="check=failure" LANES_CONFIG="$stub/escape-argv.conf"
-check "the policy cannot forge the results"     1 "nothing vouches" FILES="src/main.rs" CLASSIFY=failure RESULTS="check=failure" LANES_CONFIG="$stub/escape-env.conf"
-check "the policy cannot shadow the API client" 1 "nothing vouches" FILES="src/main.rs" CLASSIFY=failure RESULTS="check=failure" LANES_CONFIG="$stub/escape-gh.conf"
+check "shell in a config is refused, not run" 1 "unknown directive 'set'" FILES="src/main.rs" CLASSIFY=failure RESULTS="check=failure" LANES_CONFIG="$stub/shellish.conf"
 MODE=classify
-# Inert, not fatal: argv is captured before the policy loads, so `set --`
-# reaches nothing and the policy's own verdict stands -- code, here.
-check "an escaping policy classifies as code"   0 "docs_only=false" FILES="src/main.rs" LANES_CONFIG="$stub/escape-argv.conf"
-check "a well-behaved policy still answers"     0 "docs_only=true" FILES="README.md"
+check "and refused in classify too"           1 "unknown directive 'set'" FILES="src/main.rs" LANES_CONFIG="$stub/shellish.conf"
+
+# The claim the whole design rests on: a pattern is matched, never evaluated.
+rm -f /tmp/lanes-pwned
+check "a substitution-shaped rule is inert"   0 "docs_only=true" FILES="README.md" LANES_CONFIG="$stub/inert.conf"
+if [ -e /tmp/lanes-pwned ]; then
+  echo "FAIL: a rule pattern was executed"; fails=1
+else
+  echo "ok: a rule pattern is matched, never evaluated"
+fi
 
 # --- the gate needs an actual verdict to relay
 # ${RESULTS:?} catches unset and empty but not whitespace, and a string of
@@ -259,6 +251,23 @@ check "an empty changed_files count refuses"      0 "docs_only=false" FILES="REA
 MODE=gate
 check "an unreadable commit count fails the lint"  1 "unreadable commit count" FILES="README.md" SUBJECTS="docs: x" NCOMMITS="null" CLASSIFY=success RESULTS="a=skipped"
 MODE=classify
+
+# --- depth: `*` never crosses `/`
+# gitignore's rule, not bash's. A bare `case` would let `*.md` match
+# docs/DESIGN.md, making a root-only rule impossible to express -- so depth is
+# enforced separately and `**` is the explicit opt-out.
+cat > "$stub/depth.conf" <<'EOF'
+docs *.md
+docs docs/*.md
+docs deep/**/*.md
+prefixes docs
+EOF
+check "root markdown matches *.md"           0 "docs_only=true"  FILES="README.md" LANES_CONFIG="$stub/depth.conf"
+check "*.md does NOT reach a subdirectory"   0 "docs_only=false" FILES="other/DESIGN.md" LANES_CONFIG="$stub/depth.conf"
+check "one level needs its own rule"         0 "docs_only=true"  FILES="docs/DESIGN.md" LANES_CONFIG="$stub/depth.conf"
+check "and that rule stops at one level"     0 "docs_only=false" FILES="docs/a/B.md" LANES_CONFIG="$stub/depth.conf"
+check "** opts in to any depth"              0 "docs_only=true"  FILES="deep/a/b/C.md" LANES_CONFIG="$stub/depth.conf"
+check "** still respects the extension"      0 "docs_only=false" FILES="deep/a/b/c.rs" LANES_CONFIG="$stub/depth.conf"
 
 # --- classify: the rule itself, both directions per shape
 check "markdown-only diff is docs"        0 "docs_only=true"  FILES="README.md docs/DESIGN.md"
