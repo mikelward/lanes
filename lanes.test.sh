@@ -222,6 +222,20 @@ MODE=classify
 check "an escaping policy classifies as code"   0 "docs_only=false" FILES="src/main.rs" LANES_CONFIG="$stub/escape-argv.conf"
 check "a well-behaved policy still answers"     0 "docs_only=true" FILES="README.md"
 
+# --- the gate needs an actual verdict to relay
+# ${RESULTS:?} catches unset and empty but not whitespace, and a string of
+# spaces word-splits to nothing: zero iterations, all_success still standing
+# at its initial true, and the gate passes having been told nothing. Reachable
+# by ordinary misconfiguration -- consumers build this from needs.<job>.result,
+# so a renamed job renders empty.
+MODE=gate
+check "whitespace results are not a pass"    1 "named no heavy jobs" FILES="src/main.rs" CLASSIFY=success RESULTS=" "
+check "a tab-only results input too"         1 "named no heavy jobs" FILES="src/main.rs" CLASSIFY=success RESULTS="$(printf '\t')"
+check "one job vanishing names that job"     1 "Job 'msrv' reported no result" FILES="src/main.rs" CLASSIFY=success RESULTS="check=success msrv="
+check "a token with no = is refused"         1 "Malformed entry" FILES="src/main.rs" CLASSIFY=success RESULTS="check=success garbage"
+check "a real all-green input still passes"  0 "" FILES="src/main.rs" CLASSIFY=success RESULTS="check=success msrv=success"
+MODE=classify
+
 # --- classify: the rule itself, both directions per shape
 check "markdown-only diff is docs"        0 "docs_only=true"  FILES="README.md docs/DESIGN.md"
 check "code file makes it code"           0 "docs_only=false" FILES="README.md crates/app/src/main.rs"
