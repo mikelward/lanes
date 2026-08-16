@@ -23,7 +23,7 @@
 //     cost five review rounds of symlink and normalization handling, all of
 //     it defending a knob nobody had asked for.
 
-import { readFileSync, lstatSync } from "node:fs";
+import { readFileSync, lstatSync, readdirSync } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { matchesGlob } from "node:path";
 
@@ -43,11 +43,19 @@ export class PolicyError extends Error {}
  * Refused rather than resolved: resolution is what generated five rounds of
  * findings, and no consumer needs a symlinked policy. Every component is
  * checked, since a link anywhere along the path changes which bytes are read.
+ *
+ * The spelling is checked against the directory listing for the same reason.
+ * A case-insensitive runner (macOS, Windows) opens `.github/LANES.conf`
+ * through this lowercase path perfectly happily, while the files API reports
+ * the repository's own spelling -- so the engine would be reading a policy
+ * under a name no guard recognizes, which is the exact shape the fixed path
+ * exists to eliminate.
  */
-export function readPolicy(root = ".", readFile = readFileSync, lstat = lstatSync) {
+export function readPolicy(root = ".", readFile = readFileSync, lstat = lstatSync, readdir = readdirSync) {
   const parts = POLICY_PATH.split("/");
   for (let i = 0; i < parts.length; i += 1) {
     const prefix = parts.slice(0, i + 1).join("/");
+    const parent = i === 0 ? root : `${root}/${parts.slice(0, i).join("/")}`;
     let stat;
     try {
       stat = lstat(`${root}/${prefix}`);
@@ -65,6 +73,16 @@ export function readPolicy(root = ".", readFile = readFileSync, lstat = lstatSyn
       throw new PolicyError(
         `'${prefix}' is a symlink. The policy must be a plain file at ${POLICY_PATH}, ` +
           `because a link is a second place to change which rules apply.`,
+      );
+    }
+    // Opening it proved a file answers to this name, not that it IS this
+    // name. The listing is what the repository actually spells, and it is
+    // what the diff will report.
+    if (!readdir(parent).includes(parts[i])) {
+      throw new PolicyError(
+        `'${prefix}' is not spelled that way on disk. The policy must be exactly ${POLICY_PATH}, ` +
+          `because a case-insensitive filesystem would otherwise let it be read under one name ` +
+          `and classified under another.`,
       );
     }
   }
@@ -153,7 +171,14 @@ export function parsePolicy(text) {
  * independent of classify's output but not of the rules they share.
  */
 export function isDocs(path, rules) {
-  if (path === POLICY_PATH) return false;
+  // Case-insensitively, and the asymmetry is deliberate: `readPolicy` demands
+  // the exact spelling before reading anything, while this errs the other way
+  // and calls every spelling code. On a case-insensitive filesystem the two
+  // names are one file, so a diff naming `.github/LANES.conf` can be an edit
+  // to the policy in force; on a case-sensitive one it is an unrelated file
+  // that merely runs the heavy jobs. Wrongly code costs a full lane, wrongly
+  // docs skips the review of the rules themselves.
+  if (path.toLowerCase() === POLICY_PATH) return false;
   for (const { verdict, pattern } of rules) {
     if (matchesGlob(path, pattern)) return verdict === "docs";
   }

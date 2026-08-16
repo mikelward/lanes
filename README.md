@@ -41,6 +41,12 @@ being read, and every route into that — a symlinked file, a symlinked
 directory, a link chain, a `..` segment, an absolute spelling — was a way to
 change the rules while the guard watched a different name.
 
+The spelling must match the directory listing, for the same reason. A
+case-insensitive runner (macOS, Windows) opens `.github/LANES.conf` through
+the lowercase path quite happily while the files API reports the repository's
+own spelling — leaving the engine reading a policy under a name no guard
+recognizes.
+
 ```
 # Ordered: the FIRST matching rule wins, and anything matching no rule is code.
 code docs/REFERENCE.md    # compiled in by a test; see the trap below
