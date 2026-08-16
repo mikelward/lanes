@@ -57,7 +57,7 @@ the other way:
 |---|---|
 | `*.md` | `README.md` — **not** `docs/DESIGN.md` |
 | `docs/*.md` | `docs/DESIGN.md` — **not** `docs/a/B.md` |
-| `**/*.md` | markdown at any depth |
+| `**/*.md` | markdown at any depth, `README.md` included |
 | `docs/**` | everything under `docs/` |
 
 Full-line comments start with `#`; a trailing comment starts at

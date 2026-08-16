@@ -21,12 +21,18 @@ inputs:
     default: ''
   config:
     description: >-
-      Path to this repository's lane policy, relative to the checkout. It
-      defines is_docs() and LANE_PREFIXES and may override
-      dispatch_without_pr_ok(). A file rather than inputs on purpose: both
-      modes evaluate the policy, and passing it per call site would put two
-      copies in one workflow, letting the gate re-derive under rules classify
-      never used.
+      Path to this repository's lane policy, relative to the checkout.
+
+      The policy is DATA -- parsed, never executed -- with one directive per
+      line: `docs <pattern>` and `code <pattern>` (ordered, first match wins,
+      anything unmatched is code), `prefixes <words>`, and optionally
+      `dispatch-without-pr refuse|allow`. Patterns are path-aware: `*` never
+      crosses `/`, so `*.md` is root markdown, `docs/*.md` is one level down,
+      and `**/` means zero or more segments. An unknown directive is an error.
+
+      A file rather than action inputs on purpose: both modes evaluate the
+      policy, and passing it per call site would put two copies in one
+      workflow, letting the gate re-derive under rules classify never used.
     required: false
     default: '.github/lanes.conf'
   classify-result:
@@ -55,9 +61,10 @@ inputs:
 outputs:
   docs_only:
     description: >-
-      classify mode only. 'true' when every changed path is docs and
-      the verdict can be trusted, 'false' otherwise — including every failure
-      to establish it, so an unreadable diff runs the full lane.
+      classify mode only. 'true' when every changed path is documentation by
+      the policy's rules and the verdict can be trusted, 'false' otherwise —
+      including every failure to establish it, so an unreadable diff runs the
+      full lane.
     value: ${{ steps.classify.outputs.docs_only }}
 
 runs:

@@ -161,6 +161,18 @@ slashes() {
 # behaves as an ordinary crossing wildcard.
 matches_pattern() {
   local path=$1 pattern=$2
+  # `**/` means zero OR MORE segments, and the zero case needs its own try:
+  # as a bare case pattern `**/*.md` still requires a literal `/`, so it would
+  # miss README.md -- the root file the rule most obviously ought to cover.
+  # Each recursion drops one `**/`, so this terminates.
+  case "$pattern" in
+    *'**/'*)
+      # Split around the first `**/` rather than using ${var/pat/rep}: there
+      # the unquoted `/` inside the pattern would terminate it, and a glob
+      # `**/` would match far more than the literal three characters.
+      matches_pattern "$path" "${pattern%%'**/'*}${pattern#*'**/'}" && return 0
+      ;;
+  esac
   case "$pattern" in
     *'**'*) ;;
     *) test "$(slashes "$path")" = "$(slashes "$pattern")" || return 1 ;;
@@ -219,17 +231,31 @@ count_lines() {
 # Both are guarded: editing the link itself is a policy change (it decides
 # what gets sourced) and so is editing what it points at.
 policy_paths() {
-  local literal=${LANES_CONFIG#./} resolved
-  printf '%s\n' "$literal"
-  # realpath is coreutils and resolves symlinks and `..` together. A path
-  # outside the repository, or one it cannot resolve, yields nothing extra
-  # -- the literal entry still stands, so this only ever adds guarding.
-  if resolved=$(realpath --relative-to="$PWD" "$LANES_CONFIG" 2>/dev/null); then
-    case "$resolved" in
-      ../*|/*) ;;
-      *) test "$resolved" = "$literal" || printf '%s\n' "$resolved" ;;
+  local current=${LANES_CONFIG#./} target hops=0
+  while :; do
+    printf '%s\n' "$current"
+    test -L "$current" || break
+    # A chain, not a destination. `realpath` reports only where the chain
+    # ENDS, and every link along the way is separately retargetable: with
+    # .github/lanes.conf -> .github/current -> policy/real.conf, a pull
+    # request editing `.github/current` selects a different policy entirely
+    # while matching neither the configured name nor the final target.
+    hops=$((hops + 1))
+    if [ "$hops" -gt 40 ]; then
+      echo "::error::The policy path resolves through more than 40 links — refusing rather than following a possible cycle." >&2
+      return 1
+    fi
+    target=$(readlink "$current") || break
+    case "$target" in
+      /*) current=$target ;;
+      *) current="$(dirname "$current")/$target" ;;
     esac
-  fi
+    # -m so a path that does not exist still normalizes, and -s so it does
+    # NOT resolve symlinks: without -s, realpath collapses the very link this
+    # loop exists to record, jumping straight to the end of the chain.
+    current=$(realpath -m -s --relative-to="$PWD" "$current" 2>/dev/null) || break
+    case "$current" in ../*|/*) break ;; esac
+  done
 }
 
 # Resolved once, before anything is classified: the engine's own idea of

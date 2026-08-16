@@ -269,6 +269,39 @@ check "and that rule stops at one level"     0 "docs_only=false" FILES="docs/a/B
 check "** opts in to any depth"              0 "docs_only=true"  FILES="deep/a/b/C.md" LANES_CONFIG="$stub/depth.conf"
 check "** still respects the extension"      0 "docs_only=false" FILES="deep/a/b/c.rs" LANES_CONFIG="$stub/depth.conf"
 
+# --- `**/` means zero or more segments, and zero is the easy one to miss
+# As a bare case pattern `**/*.md` still requires a literal `/`, so it would
+# miss the root file the rule most obviously ought to cover.
+cat > "$stub/star.conf" <<'EOF'
+docs **/*.md
+prefixes docs
+EOF
+check "**/ matches zero segments"            0 "docs_only=true"  FILES="README.md" LANES_CONFIG="$stub/star.conf"
+check "**/ matches one segment"              0 "docs_only=true"  FILES="docs/DESIGN.md" LANES_CONFIG="$stub/star.conf"
+check "**/ matches many segments"            0 "docs_only=true"  FILES="a/b/c/D.md" LANES_CONFIG="$stub/star.conf"
+check "**/ still respects the rest"          0 "docs_only=false" FILES="a/b/c.rs" LANES_CONFIG="$stub/star.conf"
+cat > "$stub/mid.conf" <<'EOF'
+docs foo/**/bar.md
+prefixes docs
+EOF
+check "an interior **/ collapses to nothing" 0 "docs_only=true"  FILES="foo/bar.md" LANES_CONFIG="$stub/mid.conf"
+check "an interior **/ spans segments"       0 "docs_only=true"  FILES="foo/x/y/bar.md" LANES_CONFIG="$stub/mid.conf"
+
+# --- every link in the chain is the policy, not just its ends
+# realpath reports where a chain ENDS. With lanes.conf -> current -> real.conf
+# a pull request retargeting `current` selects a different policy while
+# matching neither the configured name nor the final target.
+mkdir -p "$stub/chain/.github" "$stub/chain/policy"
+cp "$stub/hostile.conf" "$stub/chain/policy/real.conf"
+ln -sf ../policy/real.conf "$stub/chain/.github/current"
+ln -sf current "$stub/chain/.github/lanes.conf"
+( cd "$stub/chain" || exit 1
+  check "the configured link is policy"      0 "docs_only=false" FILES=".github/lanes.conf" LANES_CONFIG=".github/lanes.conf"
+  check "an INTERMEDIATE link is policy"     0 "docs_only=false" FILES=".github/current" LANES_CONFIG=".github/lanes.conf"
+  check "the final target is policy"         0 "docs_only=false" FILES="policy/real.conf" LANES_CONFIG=".github/lanes.conf"
+  check "an unrelated file still rides"      0 "docs_only=true"  FILES="README.md" LANES_CONFIG=".github/lanes.conf"
+) || fails=1
+
 # --- classify: the rule itself, both directions per shape
 check "markdown-only diff is docs"        0 "docs_only=true"  FILES="README.md docs/DESIGN.md"
 check "code file makes it code"           0 "docs_only=false" FILES="README.md crates/app/src/main.rs"
