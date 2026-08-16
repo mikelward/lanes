@@ -230,31 +230,72 @@ count_lines() {
 #
 # Both are guarded: editing the link itself is a policy change (it decides
 # what gets sourced) and so is editing what it points at.
+# Every repo-relative path whose modification changes WHICH FILE the engine
+# reads as the policy.
+#
+# Three review rounds were spent enumerating routes into this one by one --
+# the configured spelling, then a multi-hop link chain, then a symlinked
+# DIRECTORY component -- so it is now answered structurally instead. Walk the
+# configured path one component at a time from the repository root; any
+# component that is a symlink is itself a policy path (retargeting it selects
+# a different file) and is recorded before being resolved, after which the
+# walk restarts against the rewritten path. Nothing is left to enumerate:
+# every component is examined, and resolution is followed transitively.
+#
+# Plain directory components are not recorded -- a directory never appears in
+# a pull request's file list, so guarding it would only add noise.
 policy_paths() {
-  local current=${LANES_CONFIG#./} target hops=0
-  while :; do
-    printf '%s\n' "$current"
-    test -L "$current" || break
-    # A chain, not a destination. `realpath` reports only where the chain
-    # ENDS, and every link along the way is separately retargetable: with
-    # .github/lanes.conf -> .github/current -> policy/real.conf, a pull
-    # request editing `.github/current` selects a different policy entirely
-    # while matching neither the configured name nor the final target.
-    hops=$((hops + 1))
-    if [ "$hops" -gt 40 ]; then
-      echo "::error::The policy path resolves through more than 40 links — refusing rather than following a possible cycle." >&2
+  local remaining=${LANES_CONFIG#./} prefix='' comp rest target rebased steps=0
+  # An absolute path is not a repository path, so no API-reported filename
+  # can ever equal one and there is nothing under it to walk. Record it and
+  # stop: still guarded if a caller compares against the same spelling, and
+  # no pretence of resolving a tree the diff cannot describe.
+  case "$remaining" in
+    /*) printf '%s\n' "$remaining"; return 0 ;;
+  esac
+  # The configured spelling itself, before any resolution. Git tracks a file
+  # at its real path, so a path THROUGH a symlinked directory should never
+  # appear in a diff -- but recording it can only widen the guard, and this
+  # walk has already been wrong four times by assuming which spellings can
+  # show up.
+  printf '%s\n' "$remaining"
+  while [ -n "$remaining" ]; do
+    # A cycle among links would otherwise spin here. The bound is generous
+    # because it counts components as well as hops.
+    steps=$((steps + 1))
+    if [ "$steps" -gt 100 ]; then
+      echo "::error::The policy path resolves through more than 100 steps — refusing rather than following a possible symlink cycle." >&2
       return 1
     fi
-    target=$(readlink "$current") || break
-    case "$target" in
-      /*) current=$target ;;
-      *) current="$(dirname "$current")/$target" ;;
-    esac
-    # -m so a path that does not exist still normalizes, and -s so it does
-    # NOT resolve symlinks: without -s, realpath collapses the very link this
-    # loop exists to record, jumping straight to the end of the chain.
-    current=$(realpath -m -s --relative-to="$PWD" "$current" 2>/dev/null) || break
-    case "$current" in ../*|/*) break ;; esac
+
+    comp=${remaining%%/*}
+    if [ "$comp" = "$remaining" ]; then rest=''; else rest=${remaining#*/}; fi
+    if [ -n "$prefix" ]; then prefix="$prefix/$comp"; else prefix=$comp; fi
+
+    if [ -L "$prefix" ]; then
+      # A link, at any depth. Record it, then follow it.
+      printf '%s\n' "$prefix"
+      target=$(readlink "$prefix") || return 0
+      case "$target" in
+        /*) rebased=$target ;;
+        *) rebased="$(dirname "$prefix")/$target" ;;
+      esac
+      # -s so this normalizes `..` WITHOUT resolving links: resolving here
+      # would skip straight past the intermediates this walk exists to find.
+      rebased=$(realpath -m -s --relative-to="$PWD" "$rebased" 2>/dev/null) || return 0
+      # A link out of the repository ends the walk; the API can never report
+      # such a path, so there is nothing further to guard.
+      case "$rebased" in ../*|/*) return 0 ;; esac
+      if [ -n "$rest" ]; then remaining="$rebased/$rest"; else remaining=$rebased; fi
+      prefix=''
+      continue
+    fi
+
+    if [ -z "$rest" ]; then
+      # The file itself, wherever the walk ended up.
+      printf '%s\n' "$prefix"
+    fi
+    remaining=$rest
   done
 }
 
