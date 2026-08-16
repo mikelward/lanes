@@ -1,0 +1,40 @@
+name: CI
+
+# Consumers track `@main` -- no tag, no SHA, deliberately, since bumping a pin
+# in every repository is the cost centralizing was meant to remove. So this
+# suite runs on the pull request, which is the only gate between a change here
+# and every consumer's required check: there is no release step afterwards to
+# catch anything. The `push` run below re-checks the commit the merge produced.
+#
+# This repository deliberately does NOT ride its own lane. The lane exists to
+# skip heavy jobs, and there are none here -- the whole suite is a few seconds
+# of bash -- so classify plus gate would add two jobs and a required check to
+# save nothing. A consumer with a real build is where it pays.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # The engine ships as text and runs on whatever bash the consumer's
+      # runner has, so a shell bug reaches every consumer with nothing between
+      # it and their merge gate.
+      - name: Lint
+        run: shellcheck lanes.sh lanes.test.sh
+
+      # Runs the real engine against a stubbed `gh`, both directions per
+      # behavior. No install step -- there is nothing to install.
+      - name: Test
+        run: ./lanes.test.sh
