@@ -33,6 +33,16 @@ inputs:
       than passed: it would otherwise report green having been told nothing.
     required: false
     default: ''
+  base-sha:
+    description: >-
+      gate mode, dispatched runs only. The `base_sha` output classify recorded
+      BEFORE the heavy jobs ran. A `pull_request` run takes this from its own
+      event payload; a workflow_dispatch has no such record, so without it the
+      gate could only read the base AFTER those jobs -- settling against
+      itself and proving nothing. A PR-bound dispatch reaching the all-green
+      path without it is refused rather than certified.
+    required: false
+    default: ''
   token:
     description: >-
       The token the engine reads the pull request with. Needs no more than
@@ -48,6 +58,12 @@ outputs:
       the policy's rules and the verdict can be trusted, 'false' otherwise --
       including every failure to establish it, so an unreadable diff runs the
       full lane.
+  base_sha:
+    description: >-
+      classify mode only. The base branch tip as it stood before the heavy
+      jobs ran. Feed it to the gate's `base-sha` input on a dispatched run;
+      a `pull_request` run ignores it and uses its own event payload, which
+      is the same commit recorded by a source the caller cannot get wrong.
 
 # The policy lives at a FIXED path, `.github/lanes.conf`, and is not an input.
 # Making it configurable meant the engine had to work out which file it was
