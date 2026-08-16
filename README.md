@@ -160,6 +160,29 @@ file, no rules, no prefixes, an unknown directive. Defaulting would look like
 the safe direction — full lane forever — while hiding a broken config
 indefinitely.
 
+## The two modes fail in opposite directions, on purpose
+
+**`classify` never fails.** It answers one question — may the heavy jobs
+skip? — and every failure to establish "yes" is "no", which runs them: a
+truncated listing, an unreadable count, a 500 from the API, an unreadable
+policy, a run that cannot be bound to its own pull request. The reason is
+reported as a `::warning::` rather than swallowed.
+
+**`gate` fails on all of it.** There the same failure means an
+already-taken skip cannot be justified, and blessing it would be the forged
+verdict this exists to prevent.
+
+That asymmetry is safe because the gate repeats every check classify shrugs
+off — it re-reads the policy, re-verifies the binding, and re-derives the
+classification before accepting a skip. So nothing is waved through: a broken
+policy still turns the required check red, one job later, having run the full
+lane in the meantime.
+
+Reading it backwards costs something either way. A gate that shrugged would
+bless any skip during an API outage; a classify that failed hard turned a
+transient blip into a blocked pull request, since the gate refuses when
+`needs.classify.result` is anything but success.
+
 ## Writing your policy
 
 Start with markdown, and keep it boring:

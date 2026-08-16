@@ -339,6 +339,37 @@ export async function classify(env, policy, ctx) {
   return paths.every((p) => isDocs(p, policy.rules));
 }
 
+/**
+ * Run the whole classify path, reporting ANY failure to establish docs-only
+ * as code.
+ *
+ * Deliberately a wrapper around all of it rather than around the one call
+ * that threw. The first version wrapped `classify` alone and left the
+ * dispatch-binding lookups in front of it still fatal -- which is the same
+ * enumerate-the-routes mistake the policy path and the glob matcher both
+ * cost rounds of, one call site at a time. There is one rule instead:
+ * **classify never fails.** It answers a single question -- may the heavy
+ * jobs skip? -- and every failure to establish "yes" is "no", which runs
+ * them. That is what the action documents `docs_only` to be.
+ *
+ * Safe because the gate repeats every one of these checks and keeps them all
+ * fatal: it re-reads the policy, re-verifies the binding, and re-derives the
+ * classification before blessing a skip. So nothing is waved through here --
+ * a broken policy or a mis-bound dispatch still turns the required check red,
+ * one job later, having run the full lane in the meantime.
+ *
+ * The reason is reported rather than swallowed: a silent `false` is
+ * indistinguishable from a diff that genuinely contains code.
+ */
+export async function classifyOrCode(work, warn = (m) => process.stdout.write(m)) {
+  try {
+    return await work();
+  } catch (err) {
+    warn(`::warning::Could not establish a docs-only diff (${err.message}) — taking the code lane.\n`);
+    return false;
+  }
+}
+
 /** Every commit subject on the docs lane must carry one of the prefixes. */
 export async function lintPrefixes(pr, policy, ctx) {
   const meta = await api(`pulls/${pr}`, ctx);
@@ -407,6 +438,11 @@ export function parseResults(raw) {
     }
     return { job, result };
   });
+  // A workflow's job IDs are unique, so a repeated name is never two heavy
+  // jobs -- it is a copy-pasted line whose name was never changed, and the
+  // job it was meant to name is the one now missing. Same family as the two
+  // above: the input silently describes fewer jobs than the workflow has, and
+  // the gate goes green having never seen the failing one's result.
   if (parsed.length === 0) {
     throw new PolicyError(
       `The results input named no heavy jobs — nothing reported, so there is nothing to pass. ` +
@@ -460,33 +496,38 @@ export async function main(env = process.env) {
   // an unpinned `@main` reference be reviewed by reading the files it runs.
   const input = (name) => env[`INPUT_${name.toUpperCase().replace(/-/g, "_")}`] || "";
   const mode = input("mode");
+  // Before anything else, so an unknown mode is an error rather than a
+  // classify-shaped fallback that reports code and exits 0.
+  if (mode !== "classify" && mode !== "gate") {
+    throw new PolicyError(`Unknown mode '${mode}' — expected 'classify' or 'gate'.`);
+  }
   const ctx = { token: input("token"), repo: env.GITHUB_REPOSITORY };
-  const policy = parsePolicy(readPolicy());
-  const shared = {
-    event: env.GITHUB_EVENT_NAME,
-    pr: input("pr"),
-    ref: env.GITHUB_REF,
-    sha: env.GITHUB_SHA,
-    classifyResult: input("classify-result"),
-    results: input("results"),
-    dispatchWithoutPr: policy.dispatchWithoutPr,
+
+  // One body for both modes, so neither can grow a check the other lacks.
+  const work = async () => {
+    const policy = parsePolicy(readPolicy());
+    const shared = {
+      event: env.GITHUB_EVENT_NAME,
+      pr: input("pr"),
+      ref: env.GITHUB_REF,
+      sha: env.GITHUB_SHA,
+      classifyResult: input("classify-result"),
+      results: input("results"),
+      dispatchWithoutPr: policy.dispatchWithoutPr,
+    };
+    verifyPrBinding(shared);
+    await verifyDispatchBinding(shared, ctx);
+    if (mode === "classify") return classify(shared, policy, ctx);
+    await gate(shared, policy, ctx);
+    return false;
   };
 
-  verifyPrBinding(shared);
-  await verifyDispatchBinding(shared, ctx);
-
-  if (mode === "classify") {
-    // Any failure to establish docs-only classifies as code: the heavy jobs
-    // run, which is always the safe direction. The gate is where an
-    // unjustified SKIP fails.
-    const docsOnly = await classify(shared, policy, ctx);
-    if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `docs_only=${docsOnly}\n`);
-    else process.stdout.write(`docs_only=${docsOnly}\n`);
-    return;
-  }
+  // The gate fails on all of it; classify fails on none of it.
   if (mode === "gate") {
-    await gate(shared, policy, ctx);
+    await work();
     return;
   }
-  throw new PolicyError(`Unknown mode '${mode}' — expected 'classify' or 'gate'.`);
+  const docsOnly = await classifyOrCode(work);
+  if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, `docs_only=${docsOnly}\n`);
+  else process.stdout.write(`docs_only=${docsOnly}\n`);
 }
