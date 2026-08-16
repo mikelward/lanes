@@ -22,6 +22,7 @@ import {
   PolicyError,
   changedPaths,
   classify,
+  classifyOrCode,
   gate,
   isDocs,
   lintPrefixes,
@@ -449,6 +450,51 @@ describe("the policy path's spelling", () => {
   });
 });
 
+describe("a classification that cannot be established", () => {
+  // One rule: classify never fails. It answers "may the heavy jobs skip?",
+  // and every failure to establish "yes" is "no", which runs them -- what the
+  // action documents `docs_only` to be. Wrapping only the `classify` call and
+  // leaving the binding lookups in front of it fatal was the same
+  // enumerate-the-routes mistake the policy path and the glob matcher each
+  // cost rounds of, so the wrapper takes the whole path.
+  const broken = { token: "t", repo: "example/repo", fetchImpl: async () => { throw new Error("network down"); } };
+
+  test("a failure anywhere in the path reports the code lane, and says why", async () => {
+    const said = [];
+    const failed = await classifyOrCode(() => classify(PR_ENV, POLICY, broken), (m) => said.push(m));
+    assert.equal(failed, false);
+    // Reported, not swallowed -- a silent false is indistinguishable from a
+    // diff that genuinely contains code.
+    assert.match(said.join(""), /::warning::.*network down.*code lane/);
+  });
+
+  test("the dispatch binding is inside the fallback, not in front of it", async () => {
+    // Its lookups are two more API calls that a blip can fail, and they run
+    // before the classification. Outside the wrapper they failed the classify
+    // job, which fails the gate, for a run that should have taken full lane.
+    const dispatch = { event: "workflow_dispatch", pr: "1", sha: "headsha", dispatchWithoutPr: "refuse" };
+    await assert.rejects(verifyDispatchBinding(dispatch, broken), /network down/, "the check really does throw");
+    assert.equal(await classifyOrCode(() => verifyDispatchBinding(dispatch, broken), () => {}), false);
+  });
+
+  test("a working classification is untouched", async () => {
+    const said = [];
+    const ok = ctx({ files: named("README.md") });
+    assert.equal(await classifyOrCode(() => classify(PR_ENV, POLICY, ok), (m) => said.push(m)), true);
+    assert.deepEqual(said, []);
+  });
+
+  test("the gate still fails closed on the same failure", async () => {
+    // Deliberately NOT wrapped there: a skip that cannot be refuted is the
+    // one the gate exists to refuse. The gate repeats every check classify
+    // shrugs off, which is what makes shrugging safe.
+    await assert.rejects(
+      gate({ ...PR_ENV, classifyResult: "success", results: "check=skipped" }, POLICY, broken),
+      /network down/,
+    );
+  });
+});
+
 describe("the entry point", () => {
   // The bug this covers is a silent success: while `lanes.mjs` ended in
   // `if (import.meta.url === `file://${process.argv[1]}`)`, a checkout under
@@ -509,5 +555,38 @@ describe("the entry point", () => {
     // Exiting 0 proves nothing on its own -- an entry point that never ran
     // exits 0 too. The output is what proves it ran.
     assert.equal(r.output, "docs_only=false\n");
+  });
+
+  test("the whole classify path falls back to code, policy read included", () => {
+    // The same missing policy the gate refuses above. End to end because the
+    // rule is about the path rather than any call on it: whatever classify
+    // mode fails to establish, it reports code and exits 0 so the heavy jobs
+    // run, and the gate is where that failure turns the check red.
+    const r = runEntry({ INPUT_MODE: "classify", GITHUB_EVENT_NAME: "push" });
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
+    assert.equal(r.output, "docs_only=false\n");
+    assert.match(r.stdout, /::warning::.*No lanes policy.*code lane/);
+  });
+
+  test("a binding failure is inside classify's fallback and outside the gate's", () => {
+    // `verifyPrBinding` needs no API, so this pins where `main` puts the
+    // binding checks rather than what the wrapper does when handed one.
+    // Naming a pull request with no `refs/pull/1/` to back it: classify takes
+    // the code lane, the gate refuses.
+    const env = { INPUT_PR: "1", GITHUB_EVENT_NAME: "pull_request", policy: "docs *.md\nprefixes docs\n" };
+    const classified = runEntry({ ...env, INPUT_MODE: "classify" });
+    assert.equal(classified.status, 0, `${classified.stdout}${classified.stderr}`);
+    assert.equal(classified.output, "docs_only=false\n");
+    const gated = runEntry({ ...env, INPUT_MODE: "gate", INPUT_CLASSIFY_RESULT: "success", INPUT_RESULTS: "check=skipped" });
+    assert.notEqual(gated.status, 0, `expected a refusal, got: ${gated.stdout}${gated.stderr}`);
+    assert.match(gated.stdout, /::error::.*must not label another's commit/);
+  });
+
+  test("an unknown mode is an error, not a code-lane fallback", () => {
+    // Otherwise a typo'd mode takes the classify path's shrug and exits 0
+    // having done nothing -- a job that looks like it classified.
+    const r = runEntry({ INPUT_MODE: "clasify", GITHUB_EVENT_NAME: "push", policy: "docs *.md\nprefixes docs\n" });
+    assert.notEqual(r.status, 0, `expected a refusal, got: ${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /::error::.*Unknown mode 'clasify'/);
   });
 });
