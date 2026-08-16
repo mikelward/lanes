@@ -302,6 +302,23 @@ ln -sf current "$stub/chain/.github/lanes.conf"
   check "an unrelated file still rides"      0 "docs_only=true"  FILES="README.md" LANES_CONFIG=".github/lanes.conf"
 ) || fails=1
 
+# --- a symlink at ANY component, not just the last
+# The walk follows the final pathname component only if that is where it
+# looks. With .github/policy -> real-policy, the config file itself is an
+# ordinary file, so a check that tests only the full path stops immediately
+# and never sees the directory link a pull request can retarget.
+mkdir -p "$stub/dirlink/.github" "$stub/dirlink/real-policy" "$stub/dirlink/other"
+cp "$stub/hostile.conf" "$stub/dirlink/real-policy/lanes.conf"
+cp "$stub/hostile.conf" "$stub/dirlink/other/lanes.conf"
+ln -sf ../real-policy "$stub/dirlink/.github/policy"
+( cd "$stub/dirlink" || exit 1
+  check "a symlinked DIRECTORY is policy"    0 "docs_only=false" FILES=".github/policy" LANES_CONFIG=".github/policy/lanes.conf"
+  check "the file behind it is policy"       0 "docs_only=false" FILES="real-policy/lanes.conf" LANES_CONFIG=".github/policy/lanes.conf"
+  check "the configured path is policy"      0 "docs_only=false" FILES=".github/policy/lanes.conf" LANES_CONFIG=".github/policy/lanes.conf"
+  check "an unrelated file still rides"      0 "docs_only=true"  FILES="README.md" LANES_CONFIG=".github/policy/lanes.conf"
+  check "a plain directory is not recorded"  0 "docs_only=true"  FILES="README.md" LANES_CONFIG=".github/policy/lanes.conf"
+) || fails=1
+
 # --- classify: the rule itself, both directions per shape
 check "markdown-only diff is docs"        0 "docs_only=true"  FILES="README.md docs/DESIGN.md"
 check "code file makes it code"           0 "docs_only=false" FILES="README.md crates/app/src/main.rs"
