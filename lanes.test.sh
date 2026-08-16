@@ -100,6 +100,27 @@ is_docs() { return 0; }
 LANE_PREFIXES="docs"
 EOF
 
+# Configs that try to escape into the engine rather than merely lie to it.
+# A sourced file IS the shell, so these are the shapes a path guard cannot
+# see: argv, the environment the engine reads later, and the API client
+# itself.
+cat > "$stub/escape-argv.conf" <<'EOF'
+is_docs() { return 1; }
+LANE_PREFIXES="docs"
+set -- classify
+EOF
+cat > "$stub/escape-env.conf" <<'EOF'
+is_docs() { return 1; }
+LANE_PREFIXES="docs"
+CLASSIFY=success
+RESULTS="everything=success"
+EOF
+cat > "$stub/escape-gh.conf" <<'EOF'
+is_docs() { return 0; }
+LANE_PREFIXES="docs"
+gh() { echo 0; }
+EOF
+
 # A config that allows a dispatched run with no pull request.
 cat > "$stub/dispatch-ok.conf" <<'EOF'
 is_docs() { case "$1" in *.md) return 0 ;; *) return 1 ;; esac; }
@@ -185,6 +206,21 @@ check "an ordinary docs PR is unaffected"      0 "docs_only=true"  FILES="README
 MODE=gate
 check "the gate refuses a policy-edit skip"    1 "refusing the skip" FILES="$stub/hostile.conf" SUBJECTS="docs: x" CLASSIFY=success RESULTS="a=skipped" LANES_CONFIG="$stub/hostile.conf"
 MODE=classify
+
+# --- the policy never reaches this shell
+# `set -- classify` once made `lanes.sh gate` run the classify arm and exit 0
+# without reading CLASSIFY or RESULTS at all: the required check green over
+# failed heavy jobs. Each of these is a different reach out of the policy and
+# into the engine, and each must fail closed rather than be defended by name.
+MODE=gate
+check "argv cannot be rewritten by the policy"  1 "" FILES="src/main.rs" CLASSIFY=failure RESULTS="check=failure" LANES_CONFIG="$stub/escape-argv.conf"
+check "the policy cannot forge the results"     1 "nothing vouches" FILES="src/main.rs" CLASSIFY=failure RESULTS="check=failure" LANES_CONFIG="$stub/escape-env.conf"
+check "the policy cannot shadow the API client" 1 "nothing vouches" FILES="src/main.rs" CLASSIFY=failure RESULTS="check=failure" LANES_CONFIG="$stub/escape-gh.conf"
+MODE=classify
+# Inert, not fatal: argv is captured before the policy loads, so `set --`
+# reaches nothing and the policy's own verdict stands -- code, here.
+check "an escaping policy classifies as code"   0 "docs_only=false" FILES="src/main.rs" LANES_CONFIG="$stub/escape-argv.conf"
+check "a well-behaved policy still answers"     0 "docs_only=true" FILES="README.md"
 
 # --- classify: the rule itself, both directions per shape
 check "markdown-only diff is docs"        0 "docs_only=true"  FILES="README.md docs/DESIGN.md"
