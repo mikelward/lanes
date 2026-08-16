@@ -1,6 +1,6 @@
 name: 'lanes'
 description: >-
-  Classify a pull request as housekeeping or code, and gate the required check
+  Classify a pull request as docs or code, and gate the required check
   on a skip that was actually justified.
 
 inputs:
@@ -22,7 +22,7 @@ inputs:
   config:
     description: >-
       Path to this repository's lane policy, relative to the checkout. It
-      defines is_housekeeping() and LANE_PREFIXES and may override
+      defines is_docs() and LANE_PREFIXES and may override
       dispatch_without_pr_ok(). A file rather than inputs on purpose: both
       modes evaluate the policy, and passing it per call site would put two
       copies in one workflow, letting the gate re-derive under rules classify
@@ -55,7 +55,7 @@ inputs:
 outputs:
   docs_only:
     description: >-
-      classify mode only. 'true' when every changed path is housekeeping and
+      classify mode only. 'true' when every changed path is docs and
       the verdict can be trusted, 'false' otherwise — including every failure
       to establish it, so an unreadable diff runs the full lane.
     value: ${{ steps.classify.outputs.docs_only }}

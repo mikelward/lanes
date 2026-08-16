@@ -1,6 +1,6 @@
 # lanes
 
-Sorts a pull request into one of two CI lanes — code or housekeeping — and
+Sorts a pull request into one of two CI lanes — code or docs — and
 holds one required check that refuses to bless a skip nothing justified.
 
 ## Why this exists
@@ -15,7 +15,7 @@ The way around it is to let every pull request run the workflow, and move the
 decision inside:
 
 - **the code lane** is the default and the common case — every heavy job runs;
-- **the housekeeping lane** lets those jobs skip when nothing in the diff can
+- **the docs lane** lets those jobs skip when nothing in the diff can
   change what they would validate;
 - **the gate** is the single check a ruleset should require. It reports on
   every pull request in either lane, and before it accepts a skip it
@@ -24,7 +24,7 @@ decision inside:
 
 Most of what is here is the gate refusing things: a truncated file listing, a
 commit heading more than one open pull request, a dispatched run that names a
-different pull request than the commit belongs to, a housekeeping commit whose
+different pull request than the commit belongs to, a docs-lane commit whose
 subject reads like a behavior change. A gate that errs toward green is worse
 than no gate, because the ruleset reports it as verification that never
 happened.
@@ -38,16 +38,16 @@ Two jobs, plus a policy file.
 ```bash
 # Which paths cannot change what the heavy jobs validate.
 # Ordered: the first arm that matches wins.
-is_housekeeping() {
+is_docs() {
   case "$1" in
-    crates/*) return 1 ;;   # a build input whatever its extension
+    docs/REFERENCE.md) return 1 ;;  # compiled in; see the trap below
     *.md) return 0 ;;
-    *) return 1 ;;          # everything else is code
+    *) return 1 ;;                  # everything else is code
   esac
 }
 
 # The commit-subject prefixes this repository's conventions give
-# housekeeping commits. On the housekeeping lane every commit must carry
+# docs-lane commits. On the docs lane every commit must carry
 # one, so nothing on that lane reads like a behavior change.
 LANE_PREFIXES="design docs todo test build refactor"
 ```
@@ -103,7 +103,7 @@ jobs:
 
 Then require **`gate`** — and only `gate` — in the ruleset for your default
 branch. Requiring a heavy job directly reintroduces the original trap: it
-never reports on the housekeeping lane, so nothing merges.
+never reports on the docs lane, so nothing merges.
 
 `permissions: contents: read` and `pull-requests: read` are enough; the engine
 writes nothing.
@@ -123,7 +123,7 @@ lane's own rules classifies as **code** and runs the full heavy lane before
 anything can act on the new rules.
 
 A config that cannot supply a policy is refused rather than defaulted: a
-missing file, one defining no `is_housekeeping`, or one with an empty
+missing file, one defining no `is_docs`, or one with an empty
 `LANE_PREFIXES` all fail loudly. Defaulting would look like the safe direction
 — full lane forever — while hiding a broken config indefinitely.
 
@@ -132,7 +132,7 @@ missing file, one defining no `is_housekeeping`, or one with an empty
 Start with markdown, and keep it boring:
 
 ```bash
-is_housekeeping() {
+is_docs() {
   case "$1" in
     *.md) return 0 ;;
     *) return 1 ;;
@@ -163,14 +163,14 @@ then that file is a build input wearing a `.md` extension:
 A real example: one consumer has a test that parses `docs/REFERENCE.md` and
 asserts every builtin it names matches the code's actual option handling — a
 guard written *because* that prose had gone stale once. Under a plain `*.md`
-policy that file rides the housekeeping lane, so editing it skips the very
+policy that file rides the docs lane, so editing it skips the very
 test that exists to catch editing it wrong.
 
 **Do not solve this with a hand-maintained exclusion list.** It drifts exactly
 like the prose did, and it drifts silently. Derive it: have a test that scans
 your source for embedding constructs, resolves each referenced path, and
 asserts that anything documentation-shaped among them is classified as code by
-your own `is_housekeeping`. Then the day someone embeds a new file, CI says so
+your own `is_docs`. Then the day someone embeds a new file, CI says so
 — which is the only moment anybody has the knowledge.
 
 That test belongs in the consumer, not here: which constructs embed files is a
@@ -187,14 +187,14 @@ Each of these is a case where a skip *looks* justified and is not:
   own figures before anything is classified.
 - **A rename out of code.** A rename carries its new path and its old one;
   judging only the new side would let a source file renamed into `docs/` ride
-  the housekeeping lane while deleting code.
+  the docs lane while deleting code.
 - **A shared head.** A commit can head more than one open pull request
   (stacked branches), and a check run is per-commit — so a gate minted for a
-  housekeeping pull request's justified skip would satisfy a stacked code pull
+  docs-lane pull request's justified skip would satisfy a stacked code pull
   request's required check too. Shared heads classify as code.
 - **A mis-bound dispatch.** `--ref` picks the branch and `-f pr=` supplies the
   number independently, so nothing else stops a dispatch on code PR A's branch
-  from naming housekeeping PR B and landing B's clean verdict on A's head.
+  from naming docs-only PR B and landing B's clean verdict on A's head.
 - **An unprefixed subject.** Merge commits are exempt structurally, by parent
   count — a commit whose subject merely starts with "Merge" is not one.
 

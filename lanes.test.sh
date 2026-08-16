@@ -60,7 +60,7 @@ chmod +x "$stub/gh"
 # exercise an ordered rule (a crate tree wins over the markdown arm) rather
 # than a single pattern that could not tell ordering bugs apart.
 cat > "$stub/default.conf" <<'EOF'
-is_housekeeping() {
+is_docs() {
   case "$1" in
     crates/*) return 1 ;;
     *.md) return 0 ;;
@@ -75,7 +75,7 @@ EOF
 # engine that ignored the config and hard-coded the default one -- the exact
 # false pass this file exists to prevent.
 cat > "$stub/other.conf" <<'EOF'
-is_housekeeping() {
+is_docs() {
   case "$1" in
     *.txt) return 0 ;;
     *) return 1 ;;
@@ -86,15 +86,15 @@ EOF
 
 # A config that loads but declares no policy, and one that declares paths but
 # no prefixes. Both must be refused rather than silently meaning "nothing is
-# housekeeping" / "no subject can pass".
+# docs" / "no subject can pass".
 : > "$stub/empty.conf"
 cat > "$stub/noprefix.conf" <<'EOF'
-is_housekeeping() { return 0; }
+is_docs() { return 0; }
 EOF
 
 # A config that allows a dispatched run with no pull request.
 cat > "$stub/dispatch-ok.conf" <<'EOF'
-is_housekeeping() { case "$1" in *.md) return 0 ;; *) return 1 ;; esac; }
+is_docs() { case "$1" in *.md) return 0 ;; *) return 1 ;; esac; }
 LANE_PREFIXES="docs"
 dispatch_without_pr_ok() { return 0; }
 EOF
@@ -129,7 +129,7 @@ check() {
 
 # --- the config is read, not assumed
 # Both directions against a policy that inverts the default one: .txt is
-# housekeeping there and markdown is not. An engine ignoring the config
+# docs there and markdown is not. An engine ignoring the config
 # answers both of these backwards.
 check "a consumer's own policy decides docs"  0 "docs_only=true"  FILES="NOTES.txt" LANES_CONFIG="$stub/other.conf"
 check "a consumer's own policy decides code"  0 "docs_only=false" FILES="README.md" LANES_CONFIG="$stub/other.conf"
@@ -140,7 +140,7 @@ MODE=classify
 
 # --- a config that cannot supply a policy is refused, never defaulted
 check "a missing config is refused"      1 "No lanes config" FILES="README.md" LANES_CONFIG="$stub/nope.conf"
-check "a config with no rule is refused"  1 "no is_housekeeping" FILES="README.md" LANES_CONFIG="$stub/empty.conf"
+check "a config with no rule is refused"  1 "no is_docs" FILES="README.md" LANES_CONFIG="$stub/empty.conf"
 check "a config with no prefixes refused"  1 "no LANE_PREFIXES" FILES="README.md" LANES_CONFIG="$stub/noprefix.conf"
 MODE=sniff
 check "an unknown mode is refused"        2 "unknown mode" FILES="README.md"
