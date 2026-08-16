@@ -53,8 +53,10 @@ has stopped biting.
 
 ## Testing
 
-- `node --test lanes.test.mjs`. No install step; it stubs the API and runs
-  the real engine against fixtures.
+- `node --test lanes.test.mjs workflows.test.mjs`. No install step; the first
+  stubs the API and runs the real engine against fixtures, the second pins
+  this repository's own workflows. Both are named in `ci.yml` rather than
+  globbed — a new test file nothing runs is a silent gap.
 - **Add or update tests with any change**, and assert **both directions** of
   every behavior — that a docs diff skips *and* that a code diff does
   not. This suite is the only thing between a push and every consumer's merge

@@ -380,8 +380,9 @@ which defines and exports and never invokes. The two were one file, separated
 by an `import.meta.url === \`file://${process.argv[1]}\`` guard — a URL
 compared against a path, which differ under a checkout containing a space or a
 `#`, and the failure was the gate exiting 0 without reading the diff.
-`node --test lanes.test.mjs` runs the real engine against a stubbed API,
-asserting both directions of every behavior.
+`node --test lanes.test.mjs workflows.test.mjs` runs the real engine against a
+stubbed API, asserting both directions of every behavior, and pins this
+repository's own workflows.
 
 ## License
 
