@@ -253,11 +253,30 @@ policy_paths() {
   case "$remaining" in
     /*) printf '%s\n' "$remaining"; return 0 ;;
   esac
-  # The configured spelling itself, before any resolution. Git tracks a file
-  # at its real path, so a path THROUGH a symlinked directory should never
-  # appear in a diff -- but recording it can only widen the guard, and this
-  # walk has already been wrong four times by assuming which spellings can
-  # show up.
+  # The configured spelling, recorded as written. Git tracks a file at its
+  # real path, so a path THROUGH a symlinked directory should never appear in
+  # a diff -- but recording it can only widen the guard.
+  printf '%s\n' "$remaining"
+  # ...and normalized, BEFORE the walk. `..` and `.` segments are a spelling
+  # the API never reports: an edit to `.github/../.github/lanes.conf` arrives
+  # as `.github/lanes.conf`. Normalizing only inside the symlink branch --
+  # which is where it ended up when this became a component walk -- leaves a
+  # plain `..` path unnormalized, which is how this regressed after having
+  # been fixed once already.
+  #
+  # -s normalizes without resolving links, so the walk below still sees every
+  # intermediate. A failure here is fatal: a policy path this cannot pin down
+  # is one the guard cannot enforce, and continuing would enforce it partly.
+  if ! remaining=$(realpath -m -s --relative-to="$PWD" "$remaining" 2>&1); then
+    echo "::error::Could not normalize the policy path '${LANES_CONFIG}': ${remaining}" >&2
+    return 1
+  fi
+  case "$remaining" in
+    ../*|/*)
+      echo "::error::The policy path '${LANES_CONFIG}' resolves outside the repository — refusing, since no changed file can ever be compared against it." >&2
+      return 1
+      ;;
+  esac
   printf '%s\n' "$remaining"
   while [ -n "$remaining" ]; do
     # A cycle among links would otherwise spin here. The bound is generous
@@ -275,14 +294,25 @@ policy_paths() {
     if [ -L "$prefix" ]; then
       # A link, at any depth. Record it, then follow it.
       printf '%s\n' "$prefix"
-      target=$(readlink "$prefix") || return 0
+      if ! target=$(readlink "$prefix" 2>&1); then
+        echo "::error::Could not read the symlink '${prefix}' on the way to the policy: ${target}" >&2
+        return 1
+      fi
       case "$target" in
         /*) rebased=$target ;;
         *) rebased="$(dirname "$prefix")/$target" ;;
       esac
       # -s so this normalizes `..` WITHOUT resolving links: resolving here
       # would skip straight past the intermediates this walk exists to find.
-      rebased=$(realpath -m -s --relative-to="$PWD" "$rebased" 2>/dev/null) || return 0
+      #
+      # A failure returns NON-zero. Returning 0 here -- as this did -- hands
+      # back the entries emitted so far as though they were the whole answer,
+      # so an edit to the unresolved remainder sails past a guard that looks
+      # like it ran. A guard that cannot complete has not passed.
+      if ! rebased=$(realpath -m -s --relative-to="$PWD" "$rebased" 2>&1); then
+        echo "::error::Could not resolve the policy symlink '${prefix}' -> '${target}': ${rebased}" >&2
+        return 1
+      fi
       # A link out of the repository ends the walk; the API can never report
       # such a path, so there is nothing further to guard.
       case "$rebased" in ../*|/*) return 0 ;; esac
@@ -302,7 +332,12 @@ policy_paths() {
 # Resolved once, before anything is classified: the engine's own idea of
 # which paths count as the policy must not be recomputed per file, and must
 # not depend on anything the policy can influence.
-POLICY_PATHS=$(policy_paths)
+# A failure here is fatal rather than a smaller answer: policy_paths returning
+# non-zero means it could not establish which paths ARE the policy, and an
+# engine that cannot answer that must not classify anything.
+if ! POLICY_PATHS=$(policy_paths); then
+  exit 1
+fi
 
 is_policy_file() {
   local candidate=${1#./} known

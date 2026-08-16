@@ -319,6 +319,27 @@ ln -sf ../real-policy "$stub/dirlink/.github/policy"
   check "a plain directory is not recorded"  0 "docs_only=true"  FILES="README.md" LANES_CONFIG=".github/policy/lanes.conf"
 ) || fails=1
 
+# --- dot segments are a spelling the API never reports
+# An edit to `.github/../.github/lanes.conf` arrives as `.github/lanes.conf`,
+# so a guard holding the unnormalized spelling misses it. This was fixed once
+# and regressed when the guard became a component walk and normalization
+# ended up inside the symlink branch only.
+mkdir -p "$stub/dots/.github"
+cp "$stub/hostile.conf" "$stub/dots/.github/lanes.conf"
+( cd "$stub/dots" || exit 1
+  check "a .. spelling still guards the real path" 0 "docs_only=false" FILES=".github/lanes.conf" LANES_CONFIG=".github/../.github/lanes.conf"
+  check "a ./ spelling does too"                   0 "docs_only=false" FILES=".github/lanes.conf" LANES_CONFIG="./.github/lanes.conf"
+  check "and an unrelated file still rides"        0 "docs_only=true"  FILES="README.md" LANES_CONFIG=".github/../.github/lanes.conf"
+) || fails=1
+
+# A policy path that leaves the repository cannot be compared against any
+# changed file, so it is refused rather than half-guarded.
+mkdir -p "$stub/outside"
+cp "$stub/hostile.conf" "$stub/outside/lanes.conf"
+( cd "$stub/dots" || exit 1
+  check "a policy path outside the repo refuses"   1 "outside the repository" FILES="README.md" LANES_CONFIG="../outside/lanes.conf"
+) || fails=1
+
 # --- classify: the rule itself, both directions per shape
 check "markdown-only diff is docs"        0 "docs_only=true"  FILES="README.md docs/DESIGN.md"
 check "code file makes it code"           0 "docs_only=false" FILES="README.md crates/app/src/main.rs"
