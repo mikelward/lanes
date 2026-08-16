@@ -35,6 +35,8 @@ jobs:
         with:
           node-version: '24'
 
-      # No install step, because there is nothing to install.
+      # No install step, because there is nothing to install. Both suites are
+      # named rather than globbed: a new test file that nothing runs is a
+      # silent gap, and naming it here is the one place that shows up.
       - name: Test
-        run: node --test lanes.test.mjs
+        run: node --test lanes.test.mjs workflows.test.mjs
