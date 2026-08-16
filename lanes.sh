@@ -19,21 +19,24 @@ set -euo pipefail
 
 # --- Consumer config -------------------------------------------------------
 #
-# Sourced rather than passed as inputs, and that is the load-bearing choice
-# here. Both modes evaluate the policy, and the gate's whole value is
-# re-deriving the classification independently *under the same rules*. Policy
-# supplied at each call site would be two copies in one workflow file, and an
-# edit to one copy would leave the gate re-deriving against rules that
-# classify never used — a check that reports green on validation it did not
-# perform. A file is one copy by construction.
+# A file rather than action inputs, and that is the load-bearing choice here.
+# Both modes evaluate the policy, and the gate's whole value is re-deriving
+# the classification independently *under the same rules*. Policy supplied at
+# each call site would be two copies in one workflow file, and an edit to one
+# copy would leave the gate re-deriving against rules that classify never
+# used — a check that reports green on validation it did not perform. A file
+# is one copy by construction.
 #
-# On a pull_request event the file sourced here is the PULL REQUEST'S copy of
-# it, since the checkout is the merge ref. So the policy cannot be trusted to
-# say whether edits to the policy are documentation -- that would let a pull
-# request answer the one question its answer must not decide, and both modes
-# would agree with it, the gate being independent of classify's output but
-# not of the policy they share. is_policy_file() settles it in the engine
-# instead: the config is code, always, whatever the config says.
+# What that costs is the whole of the care below. On a pull_request event the
+# checkout is the merge ref, so this file is the PULL REQUEST'S copy, and two
+# separate things follow:
+#
+#   - it cannot be asked whether edits to itself are documentation, which
+#     would let a pull request answer the one question its answer must not
+#     decide -- and both modes would agree, the gate being independent of
+#     classify's output but not of the policy they share. is_policy_file()
+#     settles that in the engine: the config is code, always.
+#   - it is never sourced into this shell at all. See policy_query below.
 #
 # The config defines is_docs() and LANE_PREFIXES, and may override
 # dispatch_without_pr_ok(). Everything else is engine.
@@ -392,13 +395,44 @@ case "${1:?usage: lanes.sh classify|gate}" in
     fi
     all_success=true
     all_skipped=true
+    pairs=0
     for pair in ${RESULTS:?}; do
+      # Not a job result at all, or a job whose result rendered empty. Both
+      # would fall to the catch-all below and fail closed anyway, but with a
+      # message naming the whole string rather than the entry at fault --
+      # and an empty value is the single most informative symptom there is
+      # here, since it means `needs.<job>.result` resolved to nothing and
+      # that job is the one to go looking for.
+      case "$pair" in
+        *=?*) ;;
+        *=)
+          echo "::error::Job '${pair%=}' reported no result — it was probably renamed or removed while the results input still names it."
+          exit 1
+          ;;
+        *)
+          echo "::error::Malformed entry '${pair}' in the results input — expected job=result pairs."
+          exit 1
+          ;;
+      esac
+      pairs=$((pairs + 1))
       case "${pair#*=}" in
         success) all_skipped=false ;;
         skipped) all_success=false ;;
         *) all_success=false; all_skipped=false ;;
       esac
     done
+    # `${RESULTS:?}` catches unset and empty, but not whitespace — and a
+    # string of spaces word-splits to nothing, running the loop zero times
+    # and leaving all_success standing at its initial true. The gate would
+    # then pass having received no heavy-job verdict at all, which is the
+    # fail-OPEN direction and the only one that matters here. It is reachable
+    # by ordinary misconfiguration rather than malice: consumers build this
+    # from `${{ needs.<job>.result }}`, and a renamed or deleted job renders
+    # empty, collapsing the whole input to whitespace.
+    if [ "$pairs" -eq 0 ]; then
+      echo "::error::The results input named no heavy jobs — nothing reported, so there is nothing to pass. Check that every job in it still exists."
+      exit 1
+    fi
     if [ "$all_success" = true ]; then
       exit 0
     fi
