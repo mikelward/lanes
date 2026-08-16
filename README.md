@@ -119,7 +119,15 @@ reporting green on validation it did not perform.
 
 A file is one copy by construction.
 
-**The engine, not the policy, decides that the policy file is code.** On a
+**The policy is never sourced into the engine's shell.** A sourced file *is*
+the shell, not a set of definitions: it would control the positional
+parameters, the environment the engine reads afterwards, `PATH`, and even a
+`gh()` function shadowing every API call the classification rests on. There
+is no list of those to defend, so isolation is structural — every question is
+put to a child process that shares nothing back but an exit status or one
+line of output.
+
+**And the engine, not the policy, decides that the policy file is code.** On a
 `pull_request` event the checkout is the pull request's merge ref, so the
 config sourced is the *pull request's* copy — and asking it whether edits to
 itself are documentation would let a pull request answer the one question its

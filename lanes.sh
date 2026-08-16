@@ -38,30 +38,79 @@ set -euo pipefail
 # The config defines is_docs() and LANE_PREFIXES, and may override
 # dispatch_without_pr_ok(). Everything else is engine.
 
-# Default: refuse a dispatched run that names no pull request. A repo whose
-# workflow legitimately dispatches without one (a deploy-force on the default
-# branch) overrides this in its config.
-dispatch_without_pr_ok() {
-  return 1
-}
-
 LANES_CONFIG=${LANES_CONFIG:?the config path must be set}
 if [ ! -f "$LANES_CONFIG" ]; then
   echo "::error::No lanes config at '${LANES_CONFIG}' — refusing to classify without a policy." >&2
   exit 1
 fi
-# shellcheck source=/dev/null
-. "$LANES_CONFIG"
 
-# A config that loaded but defined nothing would leave the engine with no
-# policy at all, and "no policy" must never read as "nothing is docs"
-# — that is a silent full-lane forever, which looks like the safe direction
-# but hides a broken config indefinitely. Refuse instead.
-if ! declare -F is_docs >/dev/null; then
-  echo "::error::${LANES_CONFIG} defines no is_docs() — refusing to classify without a path policy." >&2
+# The policy is NEVER sourced into this shell. Every question is put to a
+# child that shares nothing back but an exit status or one line of stdout.
+#
+# On a pull_request event the checkout is the merge ref, so this file is the
+# pull request's own copy -- and a sourced file IS the shell, not a set of
+# definitions. It would control the positional parameters (a config holding
+# `set -- classify` makes `lanes.sh gate` run the classify arm and exit 0
+# without ever reading CLASSIFY or RESULTS -- the required check green over
+# failed heavy jobs), the environment the engine reads later, PATH, and a
+# `gh()` function shadowing every API call the classification rests on.
+#
+# There is no list of those to defend, which is the point: the previous
+# version guarded the config PATH and left the shell wide open behind it.
+# Isolation is structural, so the vectors do not have to be enumerated.
+#
+# stdout is sent to stderr while the policy loads, so a config that prints
+# cannot be mistaken for the answer.
+policy_query() {
+  local fn=$1
+  shift
+  (
+    # shellcheck source=/dev/null
+    . "$LANES_CONFIG" >&2 || exit 9
+    declare -F is_docs >/dev/null || exit 8
+    # `$fn` rather than `$@` because a config holding `set --` replaces the
+    # child's own argv. It can clobber `fn` too -- but everything it can do
+    # in here ends at this child's exit status, which the engine reads as a
+    # refusal, so the worst it buys is failing its own query closed.
+    "$fn" "$@"
+  )
+}
+
+_policy_prefixes() { printf '%s' "${LANE_PREFIXES:-}"; }
+
+# Classify a whole file list in ONE child, rather than one per path: the
+# policy is sourced once, and a 3,000-file diff does not become 3,000 forks.
+_policy_classify() {
+  local new old
+  while IFS=$'\t' read -r new old; do
+    test -n "$new" || continue
+    is_docs "$new" || exit 1
+    if [ -n "$old" ]; then is_docs "$old" || exit 1; fi
+  done <<< "$1"
+  exit 0
+}
+
+# The default is refusal; a repo whose workflow legitimately dispatches
+# without a pull request (a deploy-force on the default branch) overrides
+# this in its config.
+_policy_dispatch_ok() {
+  if declare -F dispatch_without_pr_ok >/dev/null; then
+    dispatch_without_pr_ok
+  else
+    return 1
+  fi
+}
+
+# A config that loads but declares nothing would leave the engine with no
+# policy at all, and "no policy" must never read as "nothing is docs" — that
+# is a silent full-lane forever, which looks like the safe direction but
+# hides a broken config indefinitely. Refuse instead. Read once, here, into
+# engine state the policy cannot reach afterwards.
+if ! LANE_PREFIXES=$(policy_query _policy_prefixes); then
+  echo "::error::${LANES_CONFIG} could not be loaded, or defines no is_docs() — refusing to classify without a path policy." >&2
   exit 1
 fi
-if [ -z "${LANE_PREFIXES:-}" ]; then
+if [ -z "$LANE_PREFIXES" ]; then
   echo "::error::${LANES_CONFIG} sets no LANE_PREFIXES — refusing to lint subjects against an empty prefix list." >&2
   exit 1
 fi
@@ -173,29 +222,34 @@ docs_only() {
   esac
   local files any=false new old
   files=$(pr_files) || return 2
+  # The policy file is code, and the ENGINE decides that -- never the policy.
+  # Asking the policy whether edits to itself are documentation would let a
+  # pull request answer the one question its answer must not decide, and both
+  # modes would agree, the gate being independent of classify's output but
+  # not of the policy they share. Checked here, before the policy is
+  # consulted at all, on both sides of a rename so moving the file out of the
+  # way cannot launder it.
   while IFS=$'\t' read -r new old; do
     test -n "$new" || continue
     any=true
-    # The policy file is code, and the engine decides that -- never the
-    # policy. On a pull_request event the checkout is the PR's own merge ref,
-    # so the config sourced above is the PR's version: asking it whether
-    # edits to itself are documentation lets a pull request answer the one
-    # question its answer must not decide. It could return docs for both the
-    # config and the source files beside it, and BOTH modes would agree,
-    # because the gate re-derives independently of classify's output but not
-    # independently of the policy they share.
     is_policy_file "$new" && return 1
-    is_docs "$new" || return 1
-    # A rename is only docs if the path it LEFT was docs too -- including a
-    # rename that moves the policy file out of the way.
-    if [ -n "$old" ]; then
-      is_policy_file "$old" && return 1
-      is_docs "$old" || return 1
-    fi
+    if [ -n "$old" ]; then is_policy_file "$old" && return 1; fi
   done <<< "$files"
   # An empty diff is not a docs diff; refuse to vouch for it.
-  test "$any" = true
+  test "$any" = true || return 1
+  # Everything else is the policy's call, made in a child process.
+  policy_query _policy_classify "$files"
+  case $? in
+    0) return 0 ;;
+    1) return 1 ;;
+    # 8/9 are a policy that vanished or stopped loading between the check at
+    # startup and now; anything else is a child that died. Neither is a
+    # classification, so neither may read as one.
+    *) return 2 ;;
+  esac
 }
+
+
 
 # On the docs lane every commit subject must carry a docs-lane prefix. A
 # commits listing that cannot be completed fails the lint — an unverified
@@ -288,7 +342,7 @@ verify_dispatch_binding() {
   # branch), in which case docs_only classifies it as code and the full lane
   # runs.
   if [ -z "${PR:-}" ]; then
-    if dispatch_without_pr_ok; then return 0; fi
+    if policy_query _policy_dispatch_ok; then return 0; fi
     echo "::error::A dispatched run must name the pull request it reports for (the pr input) — refusing without one."
     return 1
   fi
