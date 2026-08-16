@@ -127,6 +127,56 @@ missing file, one defining no `is_housekeeping`, or one with an empty
 `LANE_PREFIXES` all fail loudly. Defaulting would look like the safe direction
 — full lane forever — while hiding a broken config indefinitely.
 
+## Writing your policy
+
+Start with markdown, and keep it boring:
+
+```bash
+is_housekeeping() {
+  case "$1" in
+    *.md) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+```
+
+The direction to move in is **narrower, not wider** — ideally only markdown
+under a dedicated `docs/` tree. "Dotfile" is a naming convention rather than a
+semantic category (`.npmrc` changes dependency resolution, `.nvmrc` picks a
+runtime, `.gitignore` can hide files from CI's own staging steps), so nothing
+rides the lane by looking incidental. Every widening is a chance to skip a job
+that would have caught something; every narrowing costs only time.
+
+### The trap: build inputs that do not look like build inputs
+
+This is the one that will bite you, because the file gives no sign of it.
+
+A repository can embed a documentation file into what it builds or tests, and
+then that file is a build input wearing a `.md` extension:
+
+- Rust: `include_str!("../../docs/REFERENCE.md")` compiles the file into the
+  binary, and a test can assert on its contents. `#![doc = include_str!(...)]`
+  goes further and runs the code fences in it as doctests.
+- JavaScript: a snapshot or fixture test that reads a `.md` file.
+- Anything with a generator or a `build.rs` that reads files at build time.
+
+A real example: one consumer has a test that parses `docs/REFERENCE.md` and
+asserts every builtin it names matches the code's actual option handling — a
+guard written *because* that prose had gone stale once. Under a plain `*.md`
+policy that file rides the housekeeping lane, so editing it skips the very
+test that exists to catch editing it wrong.
+
+**Do not solve this with a hand-maintained exclusion list.** It drifts exactly
+like the prose did, and it drifts silently. Derive it: have a test that scans
+your source for embedding constructs, resolves each referenced path, and
+asserts that anything documentation-shaped among them is classified as code by
+your own `is_housekeeping`. Then the day someone embeds a new file, CI says so
+— which is the only moment anybody has the knowledge.
+
+That test belongs in the consumer, not here: which constructs embed files is a
+property of your language, and this engine deliberately knows nothing about
+your repository beyond the policy you hand it.
+
 ## What the gate refuses
 
 Each of these is a case where a skip *looks* justified and is not:

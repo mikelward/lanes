@@ -63,26 +63,37 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # Every value below reaches the shell through `env:`, never through a
+    # `${{ }}` inside a `run:` body. GitHub substitutes an expression into the
+    # script *text* before bash parses it, so an input carrying a quote and a
+    # semicolon becomes shell source rather than shell data -- and a consumer
+    # forwarding an event field into `mode` is all it takes for that to be
+    # attacker-controlled. `env:` values are passed as data and never parsed
+    # as script, which is why even ACTION_PATH is bound here rather than
+    # interpolated: the rule is worth keeping absolute so no future edit has
+    # to re-derive which of these happen to be trusted today.
     - name: Classify the diff
       id: classify
       if: inputs.mode == 'classify'
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.token }}
         PR: ${{ inputs.pr }}
         LANES_CONFIG: ${{ inputs.config }}
-      run: '"${{ github.action_path }}/lanes.sh" classify >> "$GITHUB_OUTPUT"'
+      run: '"$ACTION_PATH/lanes.sh" classify >> "$GITHUB_OUTPUT"'
 
     - name: Verdict
       if: inputs.mode == 'gate'
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.token }}
         PR: ${{ inputs.pr }}
         LANES_CONFIG: ${{ inputs.config }}
         CLASSIFY: ${{ inputs.classify-result }}
         RESULTS: ${{ inputs.results }}
-      run: '"${{ github.action_path }}/lanes.sh" gate'
+      run: '"$ACTION_PATH/lanes.sh" gate'
 
     # A mode neither step matched would otherwise be a silent success: the
     # gate's step is skipped, the job goes green, and the required check
@@ -90,6 +101,8 @@ runs:
     - name: Reject an unknown mode
       if: inputs.mode != 'classify' && inputs.mode != 'gate'
       shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
       run: |
-        echo "::error::Unknown mode '${{ inputs.mode }}' — expected 'classify' or 'gate'."
+        echo "::error::Unknown mode '${MODE}' — expected 'classify' or 'gate'."
         exit 1
