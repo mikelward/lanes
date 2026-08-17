@@ -32,6 +32,21 @@ has stopped biting.
   edited it to edit the others too. That is a manual invariant with no
   enforcement, which is the kind that decays quietly. If a change here would
   need a matching hand-edit in a consumer, it is the wrong change.
+- **A change that touches consumers goes through ONE of them first.** That is
+  rare here by design -- the bullet above makes a consumer-side edit the sign
+  of a wrong change -- but when it is genuinely unavoidable, never open it
+  across the consumers at once. They share one automated reviewer, so a
+  finding against a change made nine times is the same finding nine times:
+  quota spent to learn nothing, and eight more chances to fix it in only some
+  of them. The sibling `mikelward/codex-review` learned this the expensive
+  way, one check hand-written in nine repositories producing three separate
+  holes in three different copies in a single afternoon.
+- **Piloting happens BEFORE the merge, not after.** Consumers track `@main`,
+  so merging here is the rollout -- there is no staging to sequence, and
+  "land it, then try it on one" would expose every consumer to a change
+  nobody has run. Point one consumer's workflow at the branch
+  (`mikelward/lanes@<branch>`) and take that pull request through review;
+  merge here only once it is green, then restore the consumer to `@main`.
 
 ## What this repository must not grow
 
