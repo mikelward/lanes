@@ -840,10 +840,15 @@ export async function gate(env, policy, ctx, pin = null) {
 
 export async function main(env = process.env) {
   // A JavaScript action receives its inputs as INPUT_<NAME>, uppercased with
-  // dashes turned to underscores. Read directly rather than through
+  // SPACES turned to underscores -- and nothing else converted: a dash stays
+  // a dash, so `classify-result` arrives as `INPUT_CLASSIFY-RESULT`. The
+  // first version of this line turned dashes to underscores too, and the
+  // suite agreed with it, setting the same misspelled names -- so every
+  // hyphenated input read as empty on a real runner and the gate refused the
+  // first consumer's all-green run. Read directly rather than through
   // @actions/core: this repository ships no dependencies, which is what lets
   // an unpinned `@main` reference be reviewed by reading the files it runs.
-  const input = (name) => env[`INPUT_${name.toUpperCase().replace(/-/g, "_")}`] || "";
+  const input = (name) => env[`INPUT_${name.replace(/ /g, "_").toUpperCase()}`] || "";
   const mode = input("mode");
   // Before anything else, so an unknown mode is an error rather than a
   // classify-shaped fallback that reports code and exits 0.
