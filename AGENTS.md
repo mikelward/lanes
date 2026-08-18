@@ -131,6 +131,13 @@ has stopped biting.
   purpose — they would prefix nearly everything and leave the log as flat as it
   started.
 
+## Talking to the user
+
+- **Respond to a mid-turn message immediately.** When the user sends a message while you're
+  still working — surfaced as a "sent while you were working" interjection — address it in
+  your very next output, before starting or continuing any further tool call, even if it's
+  only one sentence. Don't let it queue up behind an in-flight chain of tool calls.
+
 ## Privacy
 
 - **Never put user data in any artifact that leaves this machine** — commit
