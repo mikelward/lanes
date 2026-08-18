@@ -120,3 +120,109 @@ describe("the README's consumer template", () => {
     assert.doesNotMatch(usage, /Then require \*\*`gate`\*\*/);
   });
 });
+
+describe("the zizmor workflow", () => {
+  // Ported from mikelward/codex-review's own zizmor.test.js. The scan's
+  // failure modes are all silent: a dropped version pin floats the audit
+  // set, a dropped --offline puts the GitHub API inside the scan, a widened
+  // policy exempts a ref nobody decided to exempt, a narrowed path filter
+  // stops re-running the scan on the files it audits. Read with regexes over
+  // YAML like the rest of this suite -- this repository ships no YAML parser
+  // on purpose.
+  const workflow = read("zizmor.yml");
+  const policy = readFileSync(fileURLToPath(new URL("./.github/zizmor.yml", import.meta.url)), "utf8");
+
+  const stripComments = (text) =>
+    text
+      .split("\n")
+      // Full-comment lines are dropped BEFORE the inline-comment strip below
+      // -- stripping first would leave them as blank lines (the
+      // leading-whitespace branch of the inline regex still matches a bare
+      // "# ..." line), which then survive this filter since an empty string
+      // never starts with "#". A blank line breaks any check that expects
+      // two keys to sit on immediately adjacent lines.
+      .filter((line) => !line.trimStart().startsWith("#"))
+      .map((line) => line.replace(/\s+#.*$/, ""))
+      .join("\n");
+
+  // Comments stripped first, so a `# run: pipx run …` note or a step
+  // disabled by commenting out its `run:` line can't satisfy these checks —
+  // they anchor to the executable `run:` field and the live `paths:` line,
+  // not to matching text appearing anywhere in the file.
+  const workflowRun = stripComments(workflow);
+  const policyRules = stripComments(policy);
+
+  // Anchored through the full mapping chain including the top-level
+  // `rules:` key, not just the leaf `policies:` — renaming or moving
+  // anything from `rules` down to `policies` must fall through to zero
+  // entries, not silently match whatever happens to sit at the right
+  // indentation elsewhere in the file. Bounded to consecutive
+  // 8-space-indented lines so a dedent out of `policies` also stops the
+  // capture -- nothing past the mapping's own indentation can be swept in.
+  // This is as deep as the anchor chases: further structural mutations
+  // would need a real YAML parser, which this file's header already
+  // accepts as a deliberate tradeoff.
+  const policiesBlock = (text) => {
+    const m = text.match(/^rules:\n {2}unpinned-uses:\n {4}config:\n {6}policies:\n((?: {8}.*\n?)*)/);
+    return m ? m[1] : "";
+  };
+
+  const policyEntries = (text) =>
+    [...policiesBlock(text).matchAll(/^ {8}"?([^":\n]+?)"?: *(\S+)$/gm)].map((m) => `${m[1]}: ${m[2]}`);
+
+  test("pins the zizmor version exactly and scans offline", () => {
+    assert.match(workflowRun, /^\s*run: pipx run --spec zizmor==\d+\.\d+\.\d+ zizmor /m);
+    const runs = [...workflowRun.matchAll(/^\s*run: (pipx run [^\n]+)$/gm)];
+    assert.strictEqual(runs.length, 1);
+    assert.match(runs[0][1], / --offline /);
+  });
+
+  test("holds read-only permissions, once", () => {
+    assert.match(workflow, /\npermissions:\n {2}contents: read\njobs:/);
+    assert.strictEqual([...workflow.matchAll(/^ *permissions:/gm)].length, 1);
+  });
+
+  test("re-runs when anything it scans changes", () => {
+    // Unlike a consumer repo's copy of this workflow, this repository IS an
+    // action -- zizmor discovers action metadata recursively from the
+    // repository root, so the filter has to cover a nested action.yml (or
+    // .yaml) too, not just the one at the root, or a PR touching only a
+    // nested one never re-runs the scan. Matched as one contiguous block by
+    // construction, not by scanning for any `paths:` occurrence -- renaming
+    // `pull_request:` to another trigger (or reordering the block) breaks
+    // this exact-structure match, so a `paths:` line can't survive attached
+    // to the wrong trigger.
+    assert.match(
+      workflowRun,
+      /^on:\n {2}push:\n {4}branches: \[main\]\n {4}paths: \['\.github\/\*\*', '\*\*\/action\.yml', '\*\*\/action\.yaml'\]\n {2}pull_request:\n {4}paths: \['\.github\/\*\*', '\*\*\/action\.yml', '\*\*\/action\.yaml'\]\n/m,
+    );
+  });
+
+  test("holds the pin-policy table exact", () => {
+    // `@main` is the release for mikelward/codex-review, this repository's
+    // one sibling action; official actions may pin tags; the blanket
+    // hash-pin rule has to be restated because supplying policies replaces
+    // zizmor's defaults. Compared whole: an entry added, dropped, or
+    // widened (say, mikelward/*) fails here, whichever shape it takes.
+    assert.deepStrictEqual(policyEntries(policyRules), [
+      "mikelward/codex-review: ref-pin",
+      "mikelward/codex-review/.github/workflows/check-consumer.yml: ref-pin",
+      "actions/*: ref-pin",
+      "*: hash-pin",
+    ]);
+  });
+
+  test("excuses this repository's own privileged triggers, nothing else", () => {
+    // codex-review.yml and codex-review-check.yml both carry
+    // pull_request_target deliberately and check nothing out. Compared
+    // whole, so a new workflow reaching for pull_request_target is still
+    // flagged. Anchored through the full mapping chain, not just the leaf
+    // `ignore:` key — a rename or move of `dangerous-triggers` or `ignore`
+    // must fall through to zero, not match a list-item anywhere in the file.
+    // Bounded to consecutive 6-space-indented lines, for the same reason
+    // the policies extraction above stops at a dedent.
+    const m = policyRules.match(/^rules:\n[\s\S]*? {2}dangerous-triggers:\n {4}ignore:\n((?: {6}.*\n?)*)/);
+    const ignored = m ? [...m[1].matchAll(/^ +- (\S+)$/gm)].map((mm) => mm[1]) : [];
+    assert.deepStrictEqual(ignored, ["codex-review.yml", "codex-review-check.yml"]);
+  });
+});
