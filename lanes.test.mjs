@@ -675,9 +675,31 @@ describe("the entry point", () => {
     const classified = runEntry({ ...env, INPUT_MODE: "classify" });
     assert.equal(classified.status, 0, `${classified.stdout}${classified.stderr}`);
     assert.equal(classified.output, "docs_only=false\nbase_sha=\n");
-    const gated = runEntry({ ...env, INPUT_MODE: "gate", INPUT_CLASSIFY_RESULT: "success", INPUT_RESULTS: "check=skipped" });
+    const gated = runEntry({ ...env, INPUT_MODE: "gate", "INPUT_CLASSIFY-RESULT": "success", INPUT_RESULTS: "check=skipped" });
     assert.notEqual(gated.status, 0, `expected a refusal, got: ${gated.stdout}${gated.stderr}`);
     assert.match(gated.stdout, /::error::.*must not label another's commit/);
+  });
+
+  test("reads hyphenated inputs under the names the runner actually sets", () => {
+    // The runner uppercases input names and converts SPACES to underscores --
+    // nothing else -- so `classify-result` arrives as INPUT_CLASSIFY-RESULT.
+    // The first version of the entry point read INPUT_CLASSIFY_RESULT, and
+    // this suite agreed with it, setting the same misspelled name: every
+    // hyphenated input read as empty on a real runner while the tests stayed
+    // green, and the gate refused the first consumer's all-green run. Both
+    // directions: the runner's spelling reaches the engine, and the
+    // misspelling no longer does.
+    const env = {
+      GITHUB_EVENT_NAME: "push",
+      policy: "docs *.md\nprefixes docs\n",
+      INPUT_MODE: "gate",
+      INPUT_RESULTS: "check=success",
+    };
+    const real = runEntry({ ...env, "INPUT_CLASSIFY-RESULT": "success" });
+    assert.equal(real.status, 0, `${real.stdout}${real.stderr}`);
+    const misspelled = runEntry({ ...env, INPUT_CLASSIFY_RESULT: "success" });
+    assert.notEqual(misspelled.status, 0, "the underscore spelling is not what the runner sets");
+    assert.match(misspelled.stdout, /::error::.*classify did not succeed/);
   });
 
   test("an unknown mode is an error, not a code-lane fallback", () => {
