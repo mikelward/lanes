@@ -242,14 +242,18 @@
         check does not distinguish the trusted publisher from this forgery
         either, since both run as the generic GitHub Actions token
         identity. Closing this needs a credential PR-controlled Actions
-        code cannot obtain — a dedicated GitHub App whose installation
-        token is held as a secret reachable only by the finalizer job, with
-        the ruleset's required check restricted to that app as its source
-        — which is real infrastructure (provisioning the app, storing its
-        credential, confirming GitHub's required-check "expected source"
-        feature actually restricts by app identity on this account's
-        plan), not a consumer-template detail. Until this is resolved, the
-        explicit-publisher mechanism this whole design section describes
+        code cannot obtain — a dedicated GitHub App whose **App ID and
+        private key**, not a minted installation token, are held as the
+        secret reachable only by the finalizer job (an installation token
+        expires in an hour, so storing one directly would leave every later
+        run unable to publish and every consumer PR blocked; the finalizer
+        mints a fresh installation token from the stored credential on each
+        run instead), with the ruleset's required check restricted to that
+        app as its source — which is real infrastructure (provisioning the
+        app, storing its credential, confirming GitHub's required-check
+        "expected source" feature actually restricts by app identity on
+        this account's plan), not a consumer-template detail. Until this is
+        resolved, the explicit-publisher mechanism this whole design section describes
         should be understood as unproven against the exact self-
         certification threat it exists to close.
 
