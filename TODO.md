@@ -3,7 +3,7 @@
 ## Trusted verdicts need an explicit publisher
 
 - [ ] Two problems in this repository turned out to be the same problem seen
-      from different triggers, and untangling that took three rounds of
+      from different triggers, and untangling that took four rounds of
       Codex review — worth recording so the next reader doesn't re-walk it.
 
       **Problem 1: manual re-dispatch.** A workflow_dispatch-based manual
@@ -128,6 +128,39 @@
         must not carry a protected `environment:`. `statuses: write` must
         live only on the publisher job, never anywhere the PR's own code
         runs, and the publisher must hold no other secret either.
+      - Posting `pending` "before gated work starts" is necessary but not
+        sufficient against a **retarget or title edit**, which the
+        `edited` trigger (`README.md` ~L98-106) exists to re-run precisely
+        because it changes nothing about the head SHA — "a base change has
+        to start a fresh run or the old verdict simply stands," in that
+        note's own words. Under the explicit-publisher design, "the old
+        verdict simply stands" literally: the previous run's `lanes:
+        success` status remains the latest one GitHub reports for that SHA
+        for as long as it takes the new run's publisher job to reach a
+        runner and overwrite it, and anything that reads the ruleset
+        during that queue-latency window — a human merge, auto-merge — can
+        act on the stale verdict. Every consumer workflow needs a
+        `concurrency:` group keyed on the PR (or the dispatch target)
+        with `cancel-in-progress: true`, so an in-flight run superseded by
+        a newer event is canceled before its terminal write can land after
+        the newer run's and win a last-write-wins race on the commit
+        status. That closes the *overlapping-runs* half of this cleanly.
+        The *first-write latency* half — the gap between the retarget/edit
+        firing and the new run's first job actually reaching a runner —
+        cannot be closed to zero by anything in this design; it is bounded
+        by ordinary Actions queuing time, the same bound every CI-based
+        required check already lives with today (a `pull_request` run's
+        own check-run doesn't reach "in progress" instantly either). Two
+        things are still unconfirmed and belong at implementation time
+        rather than asserted here: whether GitHub's required-check
+        evaluation for the Statuses API is strictly last-write-wins by
+        creation time (it is for what this file has read informally; not
+        verified against live docs), and whether posting `pending`
+        immediately — as the very first action of every run, before even
+        checkout — measurably narrows the window in practice given
+        `pending` still doesn't count as satisfying a required check, so a
+        merge attempted in that narrower window is refused rather than
+        waved through on staleness.
       - This is now correctly scoped as an action-side change (`lanes.mjs`
         gains real logic and tests), not the "consumer-template change, not
         an action change" this file previously and wrongly claimed —
@@ -159,11 +192,18 @@
       lands, no consumer's `workflow_dispatch` documentation should
       recommend `--ref <PR-head-branch>` as a way to satisfy a PR's
       required check, and no consumer should move its gate to
-      `pull_request_target` on its own. This note stops iterating as prose
-      here — a design this security-sensitive gets the rest of its
-      scrutiny against the actual `lanes.mjs` diff, where a reviewer can
-      see what the code does rather than judge how precisely a TODO
-      describes it.
+      `pull_request_target` on its own. Four rounds of real findings
+      landed on this note (the split-workflow flaw, the engine/SHA-
+      attribution gap, merge-snapshot precision and secrets scoping, and
+      the stale-status ordering window) — each a genuinely new angle, not
+      a reshaping of the last, so each earned a fix rather than a
+      rebuttal. This note stops iterating as prose here regardless: a
+      design this security-sensitive gets the rest of its scrutiny against
+      the actual `lanes.mjs` diff, where a reviewer can see what the code
+      does rather than judge how precisely a TODO describes it, and where
+      the platform-semantics questions this file has had to leave
+      unverified (exact `pull_request_target` field values, Statuses-API
+      ordering guarantees) get answered by a live run instead of a guess.
 
 ## Review and merge gates
 
