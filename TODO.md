@@ -270,10 +270,29 @@
         infrastructure (provisioning the
         app, storing its credential, confirming GitHub's required-check
         "expected source" feature actually restricts by app identity on
-        this account's plan), not a consumer-template detail. Until this is
-        resolved, the explicit-publisher mechanism this whole design section describes
-        should be understood as unproven against the exact self-
-        certification threat it exists to close.
+        this account's plan), not a consumer-template detail.
+
+        **A bare repository or organization secret does not achieve any of
+        this.** A same-repo PR's own added `push` workflow, described
+        above, could reference `${{ secrets.APP_PRIVATE_KEY }}` exactly as
+        the legitimate initializer/finalizer do — Actions secrets at that
+        scope are not job-restricted — mint its own installation token
+        from the real credential, and post a status that genuinely does
+        carry the required App's identity, defeating the whole point. The
+        credential has to live in a GitHub **Environment** with a
+        deployment branch/ref policy restricted to the trusted base ref
+        (e.g. `main`), so only a job whose run satisfies that policy can
+        reach it. Whether this closes the hole rests on the same
+        unverified `pull_request_target` field semantics flagged above:
+        it works only if that trigger's `github.ref` is genuinely the base
+        branch (matching the environment's policy) while a same-repo PR's
+        own `push`-triggered forgery runs under the PR branch's own ref
+        (failing it) — confirm this against GitHub's live docs before
+        implementing, not assumed from what this file has read informally.
+
+        Until this is resolved, the explicit-publisher mechanism this
+        whole design section describes should be understood as unproven
+        against the exact self-certification threat it exists to close.
 
       **Alternatives considered and why they are not the design:**
       - GitHub rulesets have a "require workflows to pass" rule type that
