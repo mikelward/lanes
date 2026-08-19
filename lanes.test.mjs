@@ -86,6 +86,15 @@ function stub({
 const ctx = (opts) => ({ token: "t", repo: "example/repo", fetchImpl: stub(opts) });
 const named = (...paths) => paths.map((filename) => ({ filename }));
 const PR_ENV = { event: "pull_request", pr: "1", ref: "refs/pull/1/merge", sha: "headsha" };
+// pull_request_target's GITHUB_REF is the base branch, not refs/pull/<pr>/... --
+// so binding for it reads the event payload's own pull_request.number instead.
+const PR_TARGET_ENV = {
+  event: "pull_request_target",
+  pr: "1",
+  ref: "refs/heads/main",
+  sha: "basetip",
+  snapshot: { number: 1 },
+};
 
 const POLICY = parsePolicy(`
 code docs/REFERENCE.md
@@ -295,6 +304,14 @@ describe("classify", () => {
   test("a non-pull-request event is code", async () => {
     assert.equal(await classify({ ...PR_ENV, event: "push" }, POLICY, ctx({ files: named("README.md") })), false);
   });
+
+  test("pull_request_target classifies the same way pull_request does", async () => {
+    assert.equal(
+      await classify(PR_TARGET_ENV, POLICY, ctx({ files: named("README.md", "docs/DESIGN.md") })),
+      true,
+    );
+    assert.equal(await classify(PR_TARGET_ENV, POLICY, ctx({ files: named("src/main.rs") })), false);
+  });
 });
 
 describe("binding a run to its own pull request", () => {
@@ -313,6 +330,23 @@ describe("binding a run to its own pull request", () => {
 
   test("a prefix collision is not a match", () => {
     assert.throws(() => verifyPrBinding({ ...PR_ENV, ref: "refs/pull/11/merge" }), /must not label another/);
+  });
+
+  test("pull_request_target binds on the payload's number, not GITHUB_REF", () => {
+    // GITHUB_REF under this trigger is the base branch, so a ref matching
+    // refs/pull/<pr>/... would never be there to check -- this must not fall
+    // through to the pull_request path and refuse a genuine match, or accept
+    // one it never verified.
+    assert.doesNotThrow(() => verifyPrBinding(PR_TARGET_ENV));
+  });
+
+  test("pull_request_target refuses a pr claim the event does not name", () => {
+    assert.throws(() => verifyPrBinding({ ...PR_TARGET_ENV, pr: "2" }), /must not label another/);
+  });
+
+  test("pull_request_target refuses a missing or unreadable snapshot number", () => {
+    assert.throws(() => verifyPrBinding({ ...PR_TARGET_ENV, snapshot: {} }), /must not label another/);
+    assert.throws(() => verifyPrBinding({ ...PR_TARGET_ENV, snapshot: null }), /must not label another/);
   });
 
   test("a dispatch must name a pull request unless the policy allows none", async () => {
@@ -727,10 +761,11 @@ describe("the event snapshot", () => {
 
   test("comes from the payload, not from inputs a consumer could forget to wire", () => {
     const path = write({
-      pull_request: { head: { sha: "abc" }, base: { ref: "topic", sha: "def" } },
+      pull_request: { number: 7, head: { sha: "abc" }, base: { ref: "topic", sha: "def" } },
       repository: { default_branch: "main" },
     });
     assert.deepEqual(eventSnapshot({ GITHUB_EVENT_PATH: path }), {
+      number: 7,
       head: "abc",
       baseRef: "topic",
       baseSha: "def",
@@ -759,6 +794,16 @@ describe("binding a run to the snapshot it was triggered for", () => {
   test("an unmoved pull request yields the pin the settlement will use", async () => {
     assert.deepEqual(
       await verifyEventBinding(env(), ctx({ files: named("README.md"), tip: "basesha" })),
+      { head: "headsha", baseRef: "main", baseSha: "basesha", title: null },
+    );
+  });
+
+  test("pull_request_target takes the same path once a snapshot exists", async () => {
+    // Everything below this point reasons from the payload and live reads,
+    // neither of which differs by trigger -- only GITHUB_REF/GITHUB_SHA do,
+    // and neither is read here.
+    assert.deepEqual(
+      await verifyEventBinding(env({ event: "pull_request_target" }), ctx({ tip: "basesha" })),
       { head: "headsha", baseRef: "main", baseSha: "basesha", title: null },
     );
   });
