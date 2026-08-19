@@ -100,18 +100,34 @@
         New tests need both directions (docs skip, code fails-closed)
         under the new event name, the same standard "Testing" already
         holds every other event to.
-      - Every job the consumer's workflow gates on — `classify`, the heavy
-        job(s), and the publisher itself — must explicitly check out
-        `github.event.pull_request.head.sha` or the synthetic merge
-        (`refs/pull/<pr>/merge`) rather than the trigger's default
-        checkout, which under `pull_request_target` is the base branch.
+      - `classify` and every heavy job must explicitly check out the
+        synthetic merge (`refs/pull/<pr>/merge`) — NOT the head SHA, and
+        not either one interchangeably. `readPolicy` (lanes.mjs L54-89)
+        reads `.github/lanes.conf` from whatever the job's own checkout put
+        on disk, while `changedPaths` (~L247) diffs against the base
+        through the API independently of that checkout — so a head-only
+        checkout on a branch that predates a base-side policy change would
+        classify against a stale policy the branch never saw, producing a
+        false skip for a path the base now treats as code. Only the
+        merge snapshot keeps the two in agreement, and it's also what a
+        normal `pull_request` run already builds, so heavy jobs test what
+        will actually land rather than the head alone. The publisher makes
+        no checkout at all — it only calls the API — so this doesn't apply
+        to it, and it must not be given one.
       - The heavy job still executes the PR's own arbitrary code, exactly
         as it already does under plain `pull_request` — that is unavoidable
         for any CI that builds untrusted PRs and is not new risk. What
-        would be new risk is a secret reachable from that execution; the
-        heavy job must keep declaring `permissions: contents: read` and
-        nothing else, and `statuses: write` must live only on the publisher
-        job, never anywhere the PR's own code runs.
+        would be new risk is a secret reachable from that execution, and
+        `permissions: contents: read` is NOT what prevents that — it only
+        narrows the auto-generated `GITHUB_TOKEN`'s scope. The separate
+        `secrets` context is available to every job in a `pull_request_target`
+        run regardless of the `permissions:` block, where a plain
+        `pull_request` run from a fork would have withheld it. So `classify`
+        and every heavy job must not reference `secrets.*` anywhere —
+        directly, in an `env:`, or through a called reusable action — and
+        must not carry a protected `environment:`. `statuses: write` must
+        live only on the publisher job, never anywhere the PR's own code
+        runs, and the publisher must hold no other secret either.
       - This is now correctly scoped as an action-side change (`lanes.mjs`
         gains real logic and tests), not the "consumer-template change, not
         an action change" this file previously and wrongly claimed —
