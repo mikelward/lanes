@@ -3,7 +3,7 @@
 ## Trusted verdicts need an explicit publisher
 
 - [ ] Two problems in this repository turned out to be the same problem seen
-      from different triggers, and untangling that took four rounds of
+      from different triggers, and untangling that took five rounds of
       Codex review — worth recording so the next reader doesn't re-walk it.
 
       **Problem 1: manual re-dispatch.** A workflow_dispatch-based manual
@@ -88,8 +88,9 @@
       certifies what a normal `pull_request` run would have tested rather
       than a head-only build, binding revalidation immediately before the
       terminal write via `verifyDispatchBinding`/`stillPinned`, and
-      `statuses: write` scoped to a dedicated publisher job that executes
-      no PR code and holds no other privilege):
+      `statuses: write` scoped to jobs that execute no PR code and hold no
+      other privilege — see the initializer/finalizer split below for why
+      that is two jobs, not one):
       - `lanes.mjs` needs `pull_request_target` added everywhere
         `pull_request` is currently the only accepted event for binding
         purposes — `classify`, `verifyPrBinding`, `verifyEventBinding` —
@@ -111,9 +112,10 @@
         false skip for a path the base now treats as code. Only the
         merge snapshot keeps the two in agreement, and it's also what a
         normal `pull_request` run already builds, so heavy jobs test what
-        will actually land rather than the head alone. The publisher makes
-        no checkout at all — it only calls the API — so this doesn't apply
-        to it, and it must not be given one.
+        will actually land rather than the head alone. Neither the
+        initializer nor the finalizer below makes any checkout at all —
+        both only call the API — so this doesn't apply to either, and
+        neither must be given one.
       - The heavy job still executes the PR's own arbitrary code, exactly
         as it already does under plain `pull_request` — that is unavoidable
         for any CI that builds untrusted PRs and is not new risk. What
@@ -126,8 +128,9 @@
         and every heavy job must not reference `secrets.*` anywhere —
         directly, in an `env:`, or through a called reusable action — and
         must not carry a protected `environment:`. `statuses: write` must
-        live only on the publisher job, never anywhere the PR's own code
-        runs, and the publisher must hold no other secret either.
+        live only on the initializer and finalizer jobs below, never
+        anywhere the PR's own code runs, and neither of those two jobs may
+        hold any other secret either.
       - Posting `pending` "before gated work starts" is necessary but not
         sufficient against a **retarget or title edit**, which the
         `edited` trigger (`README.md` ~L98-106) exists to re-run precisely
@@ -161,6 +164,23 @@
         `pending` still doesn't count as satisfying a required check, so a
         merge attempted in that narrower window is refused rather than
         waved through on staleness.
+      - "A dedicated publisher job" is one job in name only — it cannot be
+        one job in fact. Posting `pending` before anything else runs means
+        that job has no `needs:` on `classify`/the heavy jobs and starts
+        immediately; posting the terminal result means reading their
+        outputs, which requires exactly that `needs:`. No single job can
+        both run before its dependencies and depend on them. So this is
+        **two** jobs: an **initializer** with no `needs:`, first in the
+        graph, that posts `pending` and does nothing else; and a
+        **finalizer** with `needs: [classify, <every heavy job>]`, last in
+        the graph, that reads their results and posts the terminal status
+        — the same job `verifyDispatchBinding`/`stillPinned` and the
+        merge-snapshot certification above already describe, just named
+        correctly now. Both are API-only (no checkout, per the bullet
+        above), both hold `statuses: write` and nothing else, and neither
+        executes PR code — the "dedicated publisher" privilege scoping
+        already specified applies to both of them, not to a single job
+        that was never implementable as specified.
       - This is now correctly scoped as an action-side change (`lanes.mjs`
         gains real logic and tests), not the "consumer-template change, not
         an action change" this file previously and wrongly claimed —
@@ -192,12 +212,15 @@
       lands, no consumer's `workflow_dispatch` documentation should
       recommend `--ref <PR-head-branch>` as a way to satisfy a PR's
       required check, and no consumer should move its gate to
-      `pull_request_target` on its own. Four rounds of real findings
+      `pull_request_target` on its own. Five rounds of real findings
       landed on this note (the split-workflow flaw, the engine/SHA-
-      attribution gap, merge-snapshot precision and secrets scoping, and
-      the stale-status ordering window) — each a genuinely new angle, not
-      a reshaping of the last, so each earned a fix rather than a
-      rebuttal. This note stops iterating as prose here regardless: a
+      attribution gap, merge-snapshot precision and secrets scoping, the
+      stale-status ordering window, and — the kind of thing that should
+      have been caught the first time it was written — a single job
+      description that quietly required running both before and after its
+      own dependencies) — each a genuinely new angle, not a reshaping of
+      the last, so each earned a fix rather than a rebuttal. This note
+      stops iterating as prose here regardless: a
       design this security-sensitive gets the rest of its scrutiny against
       the actual `lanes.mjs` diff, where a reviewer can see what the code
       does rather than judge how precisely a TODO describes it, and where
