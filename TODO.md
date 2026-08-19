@@ -255,12 +255,19 @@
         identity. Closing this needs a credential PR-controlled Actions
         code cannot obtain — a dedicated GitHub App whose **App ID and
         private key**, not a minted installation token, are held as the
-        secret reachable only by the finalizer job (an installation token
-        expires in an hour, so storing one directly would leave every later
-        run unable to publish and every consumer PR blocked; the finalizer
-        mints a fresh installation token from the stored credential on each
-        run instead), with the ruleset's required check restricted to that
-        app as its source — which is real infrastructure (provisioning the
+        secret reachable by **both the initializer and the finalizer**,
+        not the finalizer alone as an earlier revision said: once the
+        ruleset restricts the required check to this app's identity, an
+        initializer still posting `pending` as the generic Actions
+        identity would not invalidate the prior App-authenticated
+        `lanes: success` at all, reopening the exact stale-status window
+        the `pending`-first design already fixed for a retarget or title
+        edit. (An installation token expires in an hour, so storing one
+        directly would leave every later run unable to publish and every
+        consumer PR blocked; each job mints a fresh installation token
+        from the stored credential itself.) The ruleset's required check
+        stays restricted to that app as its source — which is real
+        infrastructure (provisioning the
         app, storing its credential, confirming GitHub's required-check
         "expected source" feature actually restricts by app identity on
         this account's plan), not a consumer-template detail. Until this is
