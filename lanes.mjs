@@ -337,6 +337,10 @@ export function eventSnapshot(env, readFile = readFileSync) {
   }
   const pr = payload.pull_request || {};
   return {
+    // Only `pull_request_target` binding reads this -- see `verifyPrBinding` --
+    // but it comes from the same payload every other field here does, so it is
+    // captured alongside them rather than read out separately.
+    number: pr.number ?? null,
     head: pr.head ? pr.head.sha : null,
     baseRef: pr.base ? pr.base.ref : null,
     baseSha: pr.base ? pr.base.sha : null,
@@ -357,17 +361,35 @@ export function hasPrefix(subject, prefixes) {
  * A miswired consumer would classify PR B and hang a green gate on code PR
  * A's commit.
  *
- * `GITHUB_REF` is the event's own statement of which pull request a run
- * belongs to. Unset or non-PR is refused rather than waved through.
+ * `GITHUB_REF` is `pull_request`'s own statement of which pull request a run
+ * belongs to (`refs/pull/<pr>/merge`). Unset or non-PR is refused rather than
+ * waved through.
+ *
+ * `pull_request_target` carries no such ref -- its `GITHUB_REF` is the BASE
+ * branch, since that trigger's whole point is running the base's own copy of
+ * the workflow regardless of what the pull request contains. The one fact it
+ * does carry about which pull request fired it is the event payload's own
+ * `pull_request.number`, so that is what this checks instead.
  */
-export function verifyPrBinding({ event, pr, ref }) {
-  if (event !== "pull_request") return;
-  if (!pr) return; // no claim to check; a PR-less run classifies as code
-  if (ref && new RegExp(`^refs/pull/${pr}/`).test(ref)) return;
-  throw new PolicyError(
-    `The pr input names #${pr}, but this run belongs to '${ref || "<unset>"}' — ` +
-      `a verdict computed for one pull request must not label another's commit.`,
-  );
+export function verifyPrBinding({ event, pr, ref, snapshot }) {
+  if (event === "pull_request") {
+    if (!pr) return; // no claim to check; a PR-less run classifies as code
+    if (ref && new RegExp(`^refs/pull/${pr}/`).test(ref)) return;
+    throw new PolicyError(
+      `The pr input names #${pr}, but this run belongs to '${ref || "<unset>"}' — ` +
+        `a verdict computed for one pull request must not label another's commit.`,
+    );
+  }
+  if (event === "pull_request_target") {
+    if (!pr) return;
+    const number = snapshot && snapshot.number;
+    if (number != null && Number(number) === Number(pr)) return;
+    throw new PolicyError(
+      `The pr input names #${pr}, but this run's event names ` +
+        `${number == null ? "<unset>" : `#${number}`} — a verdict computed for one pull ` +
+        `request must not label another's commit.`,
+    );
+  }
 }
 
 /**
@@ -384,12 +406,18 @@ export function verifyPrBinding({ event, pr, ref }) {
  * the later reads. `verifyPrBinding` answers a different question -- whether
  * this run belongs to the pull request the input names -- and neither
  * subsumes the other.
+ *
+ * `pull_request_target` takes the same path as `pull_request` here: once a
+ * snapshot exists, this reasons entirely from the payload and live API reads,
+ * neither of which differs by trigger. What DOES differ (`GITHUB_REF`,
+ * `GITHUB_SHA`) belongs to `verifyPrBinding` and the consumer's own workflow,
+ * not to this function.
  */
 export async function verifyEventBinding({ event, pr, snapshot }, ctx) {
-  if (event !== "pull_request") return null;
+  if (event !== "pull_request" && event !== "pull_request_target") return null;
   if (!pr) {
     throw new PolicyError(
-      `A pull_request run cannot verify its event without the pull request number.`,
+      `A ${event} run cannot verify its event without the pull request number.`,
     );
   }
   // All three, not just the head. Treating the base fields as optional made
@@ -592,7 +620,7 @@ export async function verifyDispatchBinding({ event, pr, sha, dispatchWithoutPr,
 /** true when every changed path is documentation and the verdict is trustworthy. */
 export async function classify(env, policy, ctx) {
   const { event, pr } = env;
-  if (event === "pull_request") {
+  if (event === "pull_request" || event === "pull_request_target") {
     if (!pr) return false;
     // A commit can head more than one open pull request (stacked branches),
     // and a check run is per-commit -- so a gate minted for this one's
