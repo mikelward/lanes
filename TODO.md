@@ -20,13 +20,22 @@
       dispatch resolves the named PR's actual head SHA via the API and
       posts a commit status directly onto it (`repos.createCommitStatus` or
       equivalent), rather than relying on the automatic per-job check-run
-      GitHub attributes to the dispatch ref. That needs `statuses: write`
-      (more privilege than any consumer workflow holds today), new code and
-      tests here, and its own pull request piloted against this repo before
-      any consumer adopts it — see the root README's "pilot before merge"
-      convention. Until this lands, no consumer's `workflow_dispatch`
-      documentation should recommend `--ref <PR-head-branch>` as a way to
-      satisfy a PR's required check.
+      GitHub attributes to the dispatch ref. Posting the status correctly is
+      not sufficient by itself: every job the consumer's workflow gates on
+      (the classify/gate steps here, and the consumer's own heavy jobs) must
+      also explicitly check out that same resolved PR snapshot rather than
+      the trusted ref's default checkout, or a code PR could earn a green
+      `lanes` status built and tested against `main` — the status-writing
+      path has to bind execution to the same commit it certifies, not just
+      attribution. That needs `statuses: write` (more privilege than any
+      consumer workflow holds today) plus new code and tests here — and per
+      AGENTS.md's "Piloting happens BEFORE the merge, not after", it does
+      NOT get piloted against this repository (which deliberately runs no
+      lane on itself): point one consumer's workflow at
+      `mikelward/lanes@<branch>` and take that consumer's pull request
+      through review, merging here only once it is green. Until this lands,
+      no consumer's `workflow_dispatch` documentation should recommend
+      `--ref <PR-head-branch>` as a way to satisfy a PR's required check.
 
 ## Review and merge gates
 
