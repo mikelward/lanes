@@ -19,19 +19,25 @@
       A real fix needs a distinct mechanism: a mode where a trusted-ref
       dispatch resolves the named PR's actual head SHA via the API and
       posts a commit status directly onto it (`repos.createCommitStatus` or
-      equivalent), rather than relying on the automatic per-job check-run
-      GitHub attributes to the dispatch ref. Posting the status correctly is
-      not sufficient by itself: every job the consumer's workflow gates on
-      (the classify/gate steps here, and the consumer's own heavy jobs) must
-      also explicitly check out a pinned snapshot, or a code PR could earn a
-      green `lanes` status built and tested against `main` — the
-      status-writing path has to bind execution to the commit it certifies,
-      not just attribution. That snapshot has to be the synthetic MERGE of
-      head and base, resolving and pinning both, not the head commit alone —
-      a normal `pull_request` run already tests the merge result, and a
-      head-only build could pass a dispatch while failing once actually
-      merged. The status still posts on the head SHA (that is what a
-      required check tracks), even though the heavy jobs build the merge.
+      equivalent) under the `lanes` context explicitly — the API's own
+      default context does not satisfy a ruleset requiring `lanes` by name.
+      Post a `pending` status on that head BEFORE any gated work starts,
+      too, not only the terminal result: if checkout, classification, a
+      heavy job, or the finalizer itself fails or is canceled partway
+      through, the head's previous status (a stale success from an earlier
+      run, say) must not silently remain the latest one GitHub reports.
+      Posting the status correctly is not sufficient by itself: every job
+      the consumer's workflow gates on (the classify/gate steps here, and
+      the consumer's own heavy jobs) must also explicitly check out a
+      pinned snapshot, or a code PR could earn a green `lanes` status built
+      and tested against `main` — the status-writing path has to bind
+      execution to the commit it certifies, not just attribution. That
+      snapshot has to be the synthetic MERGE of head and base, resolving
+      and pinning both, not the head commit alone — a normal `pull_request`
+      run already tests the merge result, and a head-only build could pass
+      a dispatch while failing once actually merged. The status still
+      posts on the head SHA (that is what a required check tracks), even
+      though the heavy jobs build the merge.
       That needs `statuses: write` (more privilege than any consumer
       workflow holds today) plus new code and tests here — and per
       AGENTS.md's "Piloting happens BEFORE the merge, not after", it does
