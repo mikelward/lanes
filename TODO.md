@@ -112,10 +112,17 @@
         false skip for a path the base now treats as code. Only the
         merge snapshot keeps the two in agreement, and it's also what a
         normal `pull_request` run already builds, so heavy jobs test what
-        will actually land rather than the head alone. Neither the
-        initializer nor the finalizer below makes any checkout at all —
-        both only call the API — so this doesn't apply to either, and
-        neither must be given one.
+        will actually land rather than the head alone. The finalizer needs
+        it too, for the identical reason: `main()` (lanes.mjs:863) reads
+        `.github/lanes.conf` off disk before dispatching to either mode, so
+        the finalizer's own independent re-derivation of a docs-only skip
+        (`gate` mode, lanes.mjs:818-824) fails outright with no checkout at
+        all — an earlier "neither the initializer nor the finalizer makes
+        any checkout" line was wrong for the finalizer specifically, caught
+        below. Checking out to read a policy file is not "executing PR
+        code," same as `classify` already does it safely today; only the
+        initializer is genuinely checkout-free, since it only posts
+        `pending` and never calls `gate`.
       - The heavy job still executes the PR's own arbitrary code, exactly
         as it already does under plain `pull_request` — that is unavoidable
         for any CI that builds untrusted PRs and is not new risk. What
@@ -176,10 +183,14 @@
         the graph, that reads their results and posts the terminal status
         — the same job `verifyDispatchBinding`/`stillPinned` and the
         merge-snapshot certification above already describe, just named
-        correctly now. Both are API-only (no checkout, per the bullet
-        above), both hold `statuses: write` and nothing else, and neither
-        executes PR code — the "dedicated publisher" privilege scoping
-        already specified applies to both of them, not to a single job
+        correctly now. The initializer is API-only (no checkout); the
+        finalizer checks out the merge snapshot to independently re-run
+        `gate` (per the bullet above) but, like `classify`, only reads
+        `.github/lanes.conf` from it and never executes anything else the
+        checkout contains. Both hold `statuses: write` and nothing else
+        beyond what `action.yml` already documents, and neither executes
+        PR code — the "dedicated publisher" privilege scoping already
+        specified applies to both of them, not to a single job
         that was never implementable as specified.
       - This is now correctly scoped as an action-side change (`lanes.mjs`
         gains real logic and tests), not the "consumer-template change, not
