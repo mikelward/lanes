@@ -23,12 +23,17 @@
       GitHub attributes to the dispatch ref. Posting the status correctly is
       not sufficient by itself: every job the consumer's workflow gates on
       (the classify/gate steps here, and the consumer's own heavy jobs) must
-      also explicitly check out that same resolved PR snapshot rather than
-      the trusted ref's default checkout, or a code PR could earn a green
-      `lanes` status built and tested against `main` — the status-writing
-      path has to bind execution to the same commit it certifies, not just
-      attribution. That needs `statuses: write` (more privilege than any
-      consumer workflow holds today) plus new code and tests here — and per
+      also explicitly check out a pinned snapshot, or a code PR could earn a
+      green `lanes` status built and tested against `main` — the
+      status-writing path has to bind execution to the commit it certifies,
+      not just attribution. That snapshot has to be the synthetic MERGE of
+      head and base, resolving and pinning both, not the head commit alone —
+      a normal `pull_request` run already tests the merge result, and a
+      head-only build could pass a dispatch while failing once actually
+      merged. The status still posts on the head SHA (that is what a
+      required check tracks), even though the heavy jobs build the merge.
+      That needs `statuses: write` (more privilege than any consumer
+      workflow holds today) plus new code and tests here — and per
       AGENTS.md's "Piloting happens BEFORE the merge, not after", it does
       NOT get piloted against this repository (which deliberately runs no
       lane on itself): point one consumer's workflow at
