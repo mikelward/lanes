@@ -47,6 +47,20 @@
       through review, merging here only once it is green. Until this lands,
       no consumer's `workflow_dispatch` documentation should recommend
       `--ref <PR-head-branch>` as a way to satisfy a PR's required check.
+      Two more review rounds on this note surfaced real design constraints
+      worth recording rather than continuing to expand as prose: the
+      terminal publisher has to re-settle the PR's binding (the existing
+      `verifyDispatchBinding`/`stillPinned` guarantees — exactly one open
+      PR, head, base ref, base SHA) immediately before writing the status,
+      not just at the start, since a retarget or a second PR sharing the
+      head could otherwise land a stale verdict; and `statuses: write` has
+      to be scoped to a dedicated publisher/finalizer job, never granted at
+      workflow scope or to any job that executes the PR's own code, or that
+      job's token becomes a way to self-certify. This note stops iterating
+      as prose here — a design this security-sensitive gets the rest of its
+      scrutiny against the actual implementation, where a reviewer can see
+      what the code does rather than judge how precisely a TODO describes
+      it.
 
 ## Review and merge gates
 
