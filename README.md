@@ -17,9 +17,11 @@ decision inside:
 - **the code lane** is the default and the common case — every heavy job runs;
 - **the docs lane** lets those jobs skip when nothing in the diff can
   change what they would validate;
-- **the gate** is the single check a ruleset should require. It reports on
-  every pull request in either lane, and before it accepts a skip it
-  re-derives the classification itself rather than trusting the job output
+- **the gate** is the single check a ruleset should require — conventionally
+  named `lanes` in a consumer's workflow (see Usage below); "gate" is the
+  engine's own term for the mechanism, not the label it ships under. It
+  reports on every pull request in either lane, and before it accepts a skip
+  it re-derives the classification itself rather than trusting the job output
   that caused it.
 
 Most of what is here is the gate refusing things: a truncated file listing, a
@@ -95,11 +97,11 @@ that quietly does less than it says.
 on:
   pull_request:
     # `edited` is load-bearing, not tidiness. A retarget changes what the diff
-    # is measured against while the head -- and any `gate` check run already
+    # is measured against while the head -- and any `lanes` check run already
     # minted on it -- stays exactly where it was, so a base change has to start
     # a fresh run or the old verdict simply stands. Title and body edits re-run
     # too, deliberately: the title is a subject a squash merge lands, and
-    # skipping the gate on a "harmless" edit would be worse than running it,
+    # skipping `lanes` on a "harmless" edit would be worse than running it,
     # because GitHub counts a SKIPPED required check as satisfied.
     types: [opened, synchronize, reopened, edited]
 
@@ -124,8 +126,8 @@ jobs:
   #   needs: classify
   #   if: needs.classify.outputs.docs_only != 'true'
 
-  gate:
-    name: gate
+  lanes:
+    name: lanes
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [classify, check, msrv]
@@ -143,19 +145,60 @@ jobs:
           # which takes the same commit from its own event payload. Wire it
           # anyway: without it a PR-bound workflow_dispatch cannot certify a
           # green, because nothing else records the base the heavy jobs built
-          # against — the gate runs after them.
+          # against — `lanes` runs after them.
           base-sha: ${{ needs.classify.outputs.base_sha }}
           results: >-
             check=${{ needs.check.result }}
             msrv=${{ needs.msrv.result }}
 ```
 
-Then require **`gate`** — and only `gate` — in the ruleset for your default
+Then require **`lanes`** — and only `lanes` — in the ruleset for your default
 branch. Requiring a heavy job directly reintroduces the original trap: it
 never reports on the docs lane, so nothing merges.
 
 `permissions: contents: read` and `pull-requests: read` are enough; the engine
 writes nothing.
+
+### Renaming an existing consumer's check
+
+The instruction above is for a fresh install. An existing consumer whose
+ruleset already requires the old name cannot get to a new one by editing the
+job and the ruleset in either order: rename the job first and the ruleset
+waits forever for a check nothing publishes any more; rename the ruleset
+first and it waits forever for a check nothing has published yet. Either way
+every merge blocks — this is the same "check that never reports" trap the
+gate exists to avoid, self-inflicted by the rename.
+
+There is no single atomic step, but there is a safe *sequence*, because
+adding a required check and removing one carry different risk: adding one
+that has never reported blocks every merge; removing one never does.
+
+1. **Add the new job alongside the old one**, both running `mode: gate` —
+   don't rename the existing job yet. This PR still satisfies the ruleset
+   (the old name still reports) while making the new name report for the
+   first time. Merge it.
+2. **Confirm the new name has reported successfully on a `pull_request`
+   run** — this PR's own run. Not a push to your default branch, even if
+   you've wired one: `gate`'s all-heavy-jobs-green path reports success
+   without checking the run is still bound to a pull request at all when
+   there is no `pr` to bind to, which is exactly the case for a push event —
+   so a green push run confirms nothing about the path a required check
+   actually exercises. And if any *other* pull request is open, its head
+   predates step 1 and has never run the new job either. Flipping the
+   ruleset while one of those sits unrebased leaves it waiting on a check
+   that will never report against its current head, same as the trap this
+   sequence exists to avoid. Wait for each open PR's next ordinary push (or
+   update it yourself) before moving on, not just the PR that added the job.
+3. **Flip the ruleset** to require the new name instead of the old one. A
+   tool that refuses to require a check that has never reported (as
+   `mikelward/scripts`' `repo-rules` does) turns step 2 into an enforced
+   precondition rather than a thing to remember.
+4. **Remove the old job** now that nothing requires it. This PR's head only
+   publishes the new name, which the ruleset (as of step 3) already accepts.
+
+Steps 1 and 4 are ordinary pull requests; step 3 is the one that touches
+branch protection outside a PR, and it is the only step where getting the
+order wrong reintroduces the block step 1 was there to prevent.
 
 ## What binds a verdict to the diff it was computed for
 
@@ -199,7 +242,7 @@ verified. So a verdict is bound at both ends:
 ### Require branches to be up to date
 
 **Turn on *require branches to be up to date before merging* in the ruleset, next
-to requiring `gate`.** It is a prerequisite, not a nicety, and it is what keeps a
+to requiring `lanes`.** It is a prerequisite, not a nicety, and it is what keeps a
 published verdict honest.
 
 A check run lands on a commit; the ruleset reads it whenever you press Merge.
@@ -232,9 +275,9 @@ fires on a retarget but **nothing at all fires when the base branch is pushed
 to**, so it was blind to half the problem by construction.
 
 If you cannot use the setting, the fallback is a single-writer sweep that
-recomputes and republishes `gate` when the base moves. Note *single-writer*: two
+recomputes and republishes `lanes` when the base moves. Note *single-writer*: two
 workflows publishing one check is an ordering race, and the PR's own run would
-have to stop publishing `gate` for the sweep to own it. A sweep is also
+have to stop publishing `lanes` for the sweep to own it. A sweep is also
 eventually consistent, so it narrows the window rather than closing it — a
 backstop, not a replacement for the setting.
 

@@ -7,7 +7,7 @@ lives outside the files it affects.
 
 ## This repository does not run `lanes` on itself
 
-**Decided:** no `classify` / `gate` jobs in `ci.yml`, and no
+**Decided:** no `classify` / `lanes` jobs in `ci.yml`, and no
 `.github/lanes.conf`. The suite runs on every pull request, unconditionally.
 
 **Why: this is the security-sensitive one, so it stays simple.** Consumers
@@ -23,8 +23,8 @@ thing being trusted.
 
 The self-reference is not hypothetical. Done the obvious way, with `uses: ./`,
 a branch would be judged by its own copy of the engine: rewrite `isDocs` to
-return `true`, skip every heavy job, and `gate` agrees, being the same
-rewritten engine. Avoiding that means `classify` and `gate` must run
+return `true`, skip every heavy job, and `lanes` agrees, being the same
+rewritten engine. Avoiding that means `classify` and `lanes` must run
 `mikelward/lanes@main` — so the lane would exercise the *previous* commit,
 not the one under review. That is the shape this repository has already spent
 twenty-five findings closing, and adding a fresh instance of it to guard a

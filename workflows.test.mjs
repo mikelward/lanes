@@ -96,3 +96,27 @@ describe("the codex-review workflow", () => {
     }
   });
 });
+
+describe("the README's consumer template", () => {
+  // Guards the branch-protection contract's own name, which nothing else
+  // here pins: a documentation edit that quietly restored the old "gate"
+  // example would be a false pass without this, since lanes.test.mjs only
+  // exercises the engine and workflows.test.mjs only this repository's own
+  // workflows -- neither reads what a consumer is told to name their check.
+  const readme = readFileSync(fileURLToPath(new URL("./README.md", import.meta.url)), "utf8");
+  const usage = readme.slice(
+    readme.indexOf("### 2. The jobs"),
+    readme.indexOf("### Renaming an existing consumer's check"),
+  );
+
+  test("the required-check job in the template is named lanes, not gate", () => {
+    assert.notEqual(usage.indexOf("### 2. The jobs"), -1, "Usage section not found");
+    assert.match(usage, /\n {2}lanes:\n {4}name: lanes\n/);
+    assert.doesNotMatch(usage, /\n {2}gate:\n {4}name: gate\n/);
+  });
+
+  test("instructs requiring lanes, not gate, in the ruleset", () => {
+    assert.match(usage, /Then require \*\*`lanes`\*\* — and only `lanes` —/);
+    assert.doesNotMatch(usage, /Then require \*\*`gate`\*\*/);
+  });
+});
