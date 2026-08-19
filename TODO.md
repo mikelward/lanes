@@ -3,7 +3,7 @@
 ## Trusted verdicts need an explicit publisher
 
 - [ ] Two problems in this repository turned out to be the same problem seen
-      from different triggers, and untangling that took five rounds of
+      from different triggers, and untangling that took six rounds of
       Codex review — worth recording so the next reader doesn't re-walk it.
 
       **Problem 1: manual re-dispatch.** A workflow_dispatch-based manual
@@ -186,6 +186,46 @@
         an action change" this file previously and wrongly claimed —
         retracted here rather than left standing uncorrected.
 
+      **Round six surfaced four more real gaps in a single pass, not one
+      at a time — that acceleration is the signal to stop iterating in
+      prose, not a reason to keep going.** All four are genuine (verified
+      below) and none reshape an earlier finding; they are left as an
+      explicit punch list for the implementation rather than redesigned
+      into more paragraphs, because a design that keeps growing new
+      corners under scrutiny needs code and CI to converge it, not another
+      round of text:
+      - The initializer and finalizer need `pull-requests: read` and
+        `contents: read` alongside `statuses: write`, not "nothing else."
+        `action.yml` L46-50 already documents the engine's own token
+        requirement — "no more than read access to contents and pull
+        requests" — which every earlier "no other privilege" line above
+        contradicts for any job that actually calls the engine.
+      - Nothing orders the initializer ahead of `classify` or the
+        finalizer. "First in the graph" was prose, not a `needs:` edge;
+        runner scheduling can let the finalizer finish and publish before
+        a delayed initializer's `pending` ever lands, and the later write
+        becomes the last word for that SHA regardless of which one meant
+        to be first.
+      - The finalizer needs a cancellation-aware condition
+        (`!cancelled()`), not the `always()` the current consumer template
+        already uses on its gate job to report failed dependencies
+        (`README.md:134`) — carried over unchanged, that pattern defeats
+        the `concurrency`/`cancel-in-progress` fix above, because GitHub
+        does not stop a job whose condition still evaluates true just
+        because the workflow was canceled. An outdated finalizer under
+        `always()` runs to completion regardless and can still publish its
+        stale result after a newer run's.
+      - `actions/cache` (or any persistent-state action) in a heavy job
+        moved to `pull_request_target` is a channel this design has not
+        addressed at all: a cache write there is attributed to the trusted
+        base/default ref rather than a PR-scoped one, so PR-controlled
+        code could plant a poisoned entry that a later run on the base
+        branch — holding real secrets — restores and executes. Forbidding
+        `secrets.*` in the heavy job, above, does nothing about this;
+        caching needs its own answer (disabled, explicitly scoped, or
+        proven unreachable from a PR-controlled key) before this design is
+        safe to build, and this file does not have that answer yet.
+
       **Alternatives considered and why they are not the design:**
       - GitHub rulesets have a "require workflows to pass" rule type that
         may pin a required workflow's source independently of the PR
@@ -213,14 +253,18 @@
       recommend `--ref <PR-head-branch>` as a way to satisfy a PR's
       required check, and no consumer should move its gate to
       `pull_request_target` on its own. Five rounds of real findings
-      landed on this note (the split-workflow flaw, the engine/SHA-
-      attribution gap, merge-snapshot precision and secrets scoping, the
-      stale-status ordering window, and — the kind of thing that should
-      have been caught the first time it was written — a single job
+      landed on this note and were fixed here (the split-workflow flaw,
+      the engine/SHA-attribution gap, merge-snapshot precision and secrets
+      scoping, the stale-status ordering window, and a single job
       description that quietly required running both before and after its
-      own dependencies) — each a genuinely new angle, not a reshaping of
-      the last, so each earned a fix rather than a rebuttal. This note
-      stops iterating as prose here regardless: a
+      own dependencies). **A sixth round then landed four more, all real,
+      in one pass — accelerating rather than converging, unlike every
+      round before it — and that is where this stops rewriting prose
+      instead of code.** Those four are recorded above as an explicit,
+      unresolved punch list rather than fixed here, on the judgment that a
+      document which keeps growing new corners the more it is scrutinized
+      needs an implementation and a live CI run to actually converge, not
+      a seventh paragraph. This note stops iterating as prose here: a
       design this security-sensitive gets the rest of its scrutiny against
       the actual `lanes.mjs` diff, where a reviewer can see what the code
       does rather than judge how precisely a TODO describes it, and where
