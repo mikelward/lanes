@@ -3,7 +3,7 @@
 ## Trusted verdicts need an explicit publisher
 
 - [ ] Two problems in this repository turned out to be the same problem seen
-      from different triggers, and untangling that took six rounds of
+      from different triggers, and untangling that took seven rounds of
       Codex review — worth recording so the next reader doesn't re-walk it.
 
       **Problem 1: manual re-dispatch.** A workflow_dispatch-based manual
@@ -225,6 +225,33 @@
         caching needs its own answer (disabled, explicitly scoped, or
         proven unreachable from a PR-controlled key) before this design is
         safe to build, and this file does not have that answer yet.
+      - **The most fundamental open item, and the reason the whole
+        publisher mechanism is unproven, not just its ordering and
+        checkout details:** a `statuses: write` commit status is not
+        authenticated to any particular workflow file or trigger — any
+        Actions run in the repo with that permission can write the
+        `lanes` context on any commit it can name, including its own head.
+        A same-repo PR can add a brand-new workflow triggered on plain
+        `push` (which, like any `push`-triggered run, executes the
+        definition the PR branch itself supplies) that calls
+        `repos.createCommitStatus` directly and mints its own
+        `lanes: success`, bypassing the initializer/finalizer entirely —
+        no `pull_request_target` trust boundary is even in play, because
+        nothing about this route depends on the `classify`/`lanes`/heavy
+        job graph at all. An "expected source" restriction on the required
+        check does not distinguish the trusted publisher from this forgery
+        either, since both run as the generic GitHub Actions token
+        identity. Closing this needs a credential PR-controlled Actions
+        code cannot obtain — a dedicated GitHub App whose installation
+        token is held as a secret reachable only by the finalizer job, with
+        the ruleset's required check restricted to that app as its source
+        — which is real infrastructure (provisioning the app, storing its
+        credential, confirming GitHub's required-check "expected source"
+        feature actually restricts by app identity on this account's
+        plan), not a consumer-template detail. Until this is resolved, the
+        explicit-publisher mechanism this whole design section describes
+        should be understood as unproven against the exact self-
+        certification threat it exists to close.
 
       **Alternatives considered and why they are not the design:**
       - GitHub rulesets have a "require workflows to pass" rule type that
@@ -259,12 +286,18 @@
       description that quietly required running both before and after its
       own dependencies). **A sixth round then landed four more, all real,
       in one pass — accelerating rather than converging, unlike every
-      round before it — and that is where this stops rewriting prose
+      round before it — and that is where this stopped rewriting prose
       instead of code.** Those four are recorded above as an explicit,
-      unresolved punch list rather than fixed here, on the judgment that a
-      document which keeps growing new corners the more it is scrutinized
-      needs an implementation and a live CI run to actually converge, not
-      a seventh paragraph. This note stops iterating as prose here: a
+      unresolved punch list rather than fixed here. A seventh round then
+      landed the most fundamental item yet — that a `statuses: write`
+      commit status authenticates nothing about which workflow wrote it,
+      so the entire explicit-publisher mechanism is unproven against
+      same-repo forgery via an unrelated `push`-triggered workflow —
+      appended to the same punch list as one more open item rather than
+      redesigned, on the same judgment: a document which keeps growing new
+      corners the more it is scrutinized needs an implementation and a
+      live CI run to actually converge, not another paragraph. This note
+      stops iterating as prose here: a
       design this security-sensitive gets the rest of its scrutiny against
       the actual `lanes.mjs` diff, where a reviewer can see what the code
       does rather than judge how precisely a TODO describes it, and where
