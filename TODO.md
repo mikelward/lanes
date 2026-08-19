@@ -69,69 +69,78 @@
       the pull request's own merge ref — not from the base branch. A pull
       request touching its own `.github/workflows/ci.yml` (or `test.yml`)
       can therefore rewrite the `lanes` job to `run: exit 0` and mint its
-      own green required check. This is not a bug in the workflow_dispatch
-      item above, or specific to any one consumer — it is how
-      `pull_request`-triggered CI works everywhere, and it predates every
-      consumer this fleet has retrofitted. Codex found it reviewing
-      unixtools#30 (mikelward/unixtools); the owner asked for it to be
-      designed here rather than accepted as risk or patched ad hoc per
-      consumer.
-      **This is not a new problem in this fleet — `mikelward/codex-review`
-      already solved it for `codex-review-check.yml`, and
-      `docs/CONSUMER.md` there is the reference.** The shape: trigger on
-      `pull_request_target` instead of `pull_request`. GitHub loads that
-      trigger's job definition from the **base** branch always, so a PR
-      cannot alter what its own required check runs. `pull_request_target`
-      is normally dangerous — it hands elevated permissions and secrets to
-      whatever the job executes, and if that includes the PR's own code, a
-      malicious PR can exfiltrate them — but `codex-review-check.yml`'s
-      job never executes anything from the PR tree; it checks out the PR
-      head only to parse it as data. That is what makes the trigger safe
-      there, and it is true of `classify`/`lanes` here too: both call the
-      `mikelward/lanes` action, which reads the pull request through the
-      GitHub API and never checks out or runs anything the PR supplies.
-      **The design, concretely:**
-      - `classify` and `lanes` (gate) move to `pull_request_target`. Their
-        job definitions become immune to PR-branch tampering, the same way
-        `check-consumer.yml`'s is.
-      - The consumer's own heavy job (`build`/`test`) STAYS on plain
-        `pull_request` — sandboxed, no secrets, and it is the one job that
-        legitimately has to build and run the PR's own code. Moving it to
-        `pull_request_target` would trade this hole for the classic
-        `pull_request_target` one: untrusted code running with real
-        permissions.
-      - `pull_request` and `pull_request_target` firing on the same file
-        are two SEPARATE workflow runs, not two events in one run —
-        `needs:` cannot bridge them, so the gate job cannot simply
-        `needs: build` the way it does now. Bridge with either
-        `workflow_run` (GitHub's documented pattern for exactly this: a
-        privileged workflow that triggers on another workflow's
-        completion and is always loaded from the default branch,
-        regardless of what triggered the workflow it is reacting to) or
-        have the trusted gate job poll the heavy job's check-run /
-        commit-status directly via the API, matched by head SHA. Either
-        way this is the SAME primitive as the workflow_dispatch fix above
-        — a trusted, secrets-scoped process that re-attests to a result it
-        read rather than one it computed — so one engine change plausibly
-        closes both holes at once; design them together, not twice.
-      - Inherited gotcha, hard-won in `codex-review`'s own history:
-        `pull_request_target` sets `GITHUB_SHA` to the BASE branch tip, not
-        the pull request head. Anything here that needs the head SHA must
-        say `github.event.pull_request.head.sha` explicitly — never bare
-        `github.sha` — the same discipline the workflow_dispatch fix above
-        already requires.
-      - Same privilege isolation as the dispatch fix: whatever token can
-        write the final result belongs only on the dedicated gate job,
-        never on the heavy job that executes the PR's own code.
+      own green required check. This is not specific to any one consumer —
+      it is how `pull_request`-triggered CI works everywhere, and it
+      predates every consumer this fleet has retrofitted. Codex found it
+      reviewing unixtools#30 (mikelward/unixtools); the owner asked for it
+      to be designed here rather than accepted as risk or patched ad hoc
+      per consumer.
+
+      **Not a new problem for this account** — `mikelward/codex-review`
+      already solved the job-definition half of it for
+      `codex-review-check.yml`, documented in its own `docs/CONSUMER.md`:
+      trigger on `pull_request_target` instead of `pull_request`. GitHub
+      loads that trigger's job definition from the **base** branch always,
+      so a PR cannot alter what its own required check runs.
+
+      **First pass at this design (superseded below) split the workflow**:
+      `classify`/`lanes` on `pull_request_target`, the heavy `build`/`test`
+      job left on plain `pull_request`, bridged by `workflow_run` or API
+      polling. Codex found the fatal flaw in review: the heavy job's own
+      workflow definition would STILL load from the PR's merge ref, so a
+      PR could replace its build/test steps with `exit 0` while keeping
+      the job name, and the "trusted" gate would faithfully read that fake
+      success and publish `lanes: success` — the same hole, one hop
+      removed. `check-consumer.yml` never ran into this because its heavy
+      work is Codex's AI review, which "never checks out or executes pull
+      request code at all" — `lanes` consumers are different in kind: the
+      heavy job's entire job is to execute the PR's own code, which
+      `codex-review` never had to solve.
+
+      **The corrected design: move the WHOLE workflow to
+      `pull_request_target`** — `classify`, the heavy job(s), and `lanes`
+      together, not split. That fixes both halves of Codex's finding at
+      once and removes the cross-run bridge entirely, since every job is
+      now part of the same trusted run and `needs:` works normally again
+      (this also answers Codex's second finding: `classify`'s
+      `docs_only` output gates the heavy job via a plain `needs:`
+      dependency in the same run, exactly as it does today — nothing
+      cross-run to preserve).
+      - `pull_request_target`'s default checkout is the BASE branch, not
+        the PR — every job must explicitly check out
+        `github.event.pull_request.head.sha` (the head) or
+        `refs/pull/<pr>/merge` (the merge snapshot a normal `pull_request`
+        run already tests) rather than relying on the default. Get this
+        wrong and the heavy job silently builds `main`.
+      - The heavy job still executes the PR's own arbitrary code — that
+        was already true under plain `pull_request` and does not change.
+        What `pull_request_target` adds is real risk ONLY if the job also
+        holds secrets the executed code could exfiltrate. It must not:
+        every consumer's heavy job already declares `permissions:
+        contents: read` and nothing else, and that has to stay true here —
+        no secrets, no elevated token, on any job that builds the PR's
+        code. With nothing worth stealing, running that code under a
+        trusted job definition is a strict improvement over today (job
+        definition tamper-proof) with no new exposure (still arbitrary
+        code execution on the runner, exactly as unavoidable under plain
+        `pull_request` CI for any project that builds untrusted PRs).
+      - This needs no `lanes.mjs` engine change and no new privilege
+        (`statuses: write` etc.) — `classify`/`gate` keep reporting through
+        their own Actions check-run, same mechanism as today, just under a
+        trigger the PR branch cannot rewrite. It is a consumer-template
+        change, not an action change, and is UNRELATED to the
+        `workflow_dispatch` fix above beyond sharing this file — that one
+        still needs its own `statuses: write` publisher mechanism if it is
+        ever pursued; don't conflate the two designs again.
+
       **Alternatives considered and why they are not the design:**
       - GitHub rulesets have a "require workflows to pass" rule type that
         may pin a required workflow's source independently of the PR
         branch. Not adopted as the design because its exact semantics are
         unverified — `docs.github.com` was unreachable while investigating
         this — so confirm directly against GitHub's current docs before
-        relying on it; it may turn out to be a simpler answer than the
-        `pull_request_target` split above, or unavailable on this account's
-        plan.
+        relying on it; it may turn out to be a simpler answer than
+        `pull_request_target`, or unavailable on this account's plan.
       - CODEOWNERS + a required review on `.github/workflows/**` would also
         close this (GitHub does not let a PR's own author satisfy a
         required review), but every PR in this fleet is opened and merged
@@ -141,6 +150,7 @@
         specifically for CI/workflow changes, which are common. Rejected
         as the default fix for that reason; worth having as a defense in
         depth once the real fix lands, not instead of it.
+
       Per AGENTS.md's "Piloting happens BEFORE the merge, not after", this
       does NOT get piloted against this repository (which deliberately
       runs no lane on itself): point one consumer's workflow at
