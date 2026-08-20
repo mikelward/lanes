@@ -16,6 +16,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, readFileSync, syml
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { generateKeyPairSync, createVerify } from "node:crypto";
 
 import {
   POLICY_PATH,
@@ -35,6 +36,14 @@ import {
   eventSnapshot,
   stillPinned,
   baseTip,
+  signAppJwt,
+  installationId,
+  installationToken,
+  appToken,
+  statusSha,
+  publishStatus,
+  publishPending,
+  publishResult,
 } from "./lanes.mjs";
 
 /** A stubbed API: canned bodies keyed by a substring of the request path. */
@@ -1067,5 +1076,244 @@ describe("reading a base branch's tip", () => {
     // different ref entirely, while the slashes are real separators.
     await baseTip("feature/a#b", spy);
     assert.match(seen[0], /\/git\/ref\/heads\/feature\/a%23b$/);
+  });
+});
+
+// --- Publishing --------------------------------------------------------
+//
+// The App-authentication flow (JWT -> installation lookup -> installation
+// token -> status POST) is GitHub's own long-stable mechanism, so these
+// cover the shape of the calls this file makes, not the platform's own
+// contract. `sign` and `fetchImpl` are stubbed throughout except for one
+// real RSA round trip, which is what actually proves the JWT this file
+// produces is one GitHub would accept.
+
+describe("signing an App JWT", () => {
+  test("a real key produces a JWT whose signature actually verifies", () => {
+    const { publicKey, privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+    });
+    const now = 1_700_000_000;
+    const jwt = signAppJwt(123, privateKey, now);
+    const [encHeader, encPayload, encSig] = jwt.split(".");
+    assert.deepEqual(JSON.parse(Buffer.from(encHeader, "base64url").toString()), {
+      alg: "RS256",
+      typ: "JWT",
+    });
+    // Backdated 60s for clock drift, capped at GitHub's own 10-minute max --
+    // both load-bearing: a iat GitHub reads as still in the future is
+    // rejected outright, and an exp past 10 minutes is refused too.
+    assert.deepEqual(JSON.parse(Buffer.from(encPayload, "base64url").toString()), {
+      iat: now - 60,
+      exp: now + 600,
+      iss: "123", // a number in, a string out -- iss is a claim, not an id
+    });
+    const verifier = createVerify("RSA-SHA256").update(`${encHeader}.${encPayload}`);
+    assert.equal(verifier.verify(publicKey, Buffer.from(encSig, "base64url")), true);
+  });
+
+  test("a stubbed signer is what every other test in this section uses", () => {
+    const jwt = signAppJwt(1, "unused-key", 1000, () => Buffer.from("sig"));
+    assert.equal(jwt.split(".")[2], Buffer.from("sig").toString("base64url"));
+  });
+});
+
+const stubSign = () => Buffer.from("sig");
+
+/** Records every request made through it, keyed by a substring of the path. */
+function appFetchStub({ installation = { id: 42 }, token = "inst-token", statusOk = true } = {}) {
+  const calls = [];
+  const fetchImpl = async (url, opts = {}) => {
+    const path = new URL(url).pathname;
+    calls.push({ path, method: opts.method || "GET", headers: opts.headers, body: opts.body });
+    if (/\/installation$/.test(path)) {
+      return installation === null
+        ? { ok: false, status: 404, json: async () => ({}) }
+        : { ok: true, status: 200, json: async () => installation };
+    }
+    if (/\/access_tokens$/.test(path)) {
+      return token === null
+        ? { ok: false, status: 401, json: async () => ({}) }
+        : { ok: true, status: 201, json: async () => ({ token }) };
+    }
+    if (/\/statuses\//.test(path)) {
+      return statusOk
+        ? { ok: true, status: 201, json: async () => ({}) }
+        : { ok: false, status: 422, json: async () => ({}) };
+    }
+    throw new Error(`unstubbed route: ${path}`);
+  };
+  return { fetchImpl, calls };
+}
+
+describe("exchanging the App credential for a token", () => {
+  test("installationId reads this repo's installation, authenticated as the App", async () => {
+    const { fetchImpl, calls } = appFetchStub();
+    assert.equal(await installationId("example/repo", "jwt", fetchImpl), 42);
+    assert.equal(calls[0].headers.authorization, "Bearer jwt");
+  });
+
+  test("no installation on this repo is refused, not treated as id undefined", async () => {
+    const { fetchImpl } = appFetchStub({ installation: null });
+    await assert.rejects(installationId("example/repo", "jwt", fetchImpl), /is it installed there/);
+  });
+
+  test("installationToken mints a fresh token from the App JWT, never the installation id alone", async () => {
+    const { fetchImpl, calls } = appFetchStub();
+    assert.equal(await installationToken(42, "jwt", fetchImpl), "inst-token");
+    assert.equal(calls[0].method, "POST");
+    assert.equal(calls[0].headers.authorization, "Bearer jwt");
+  });
+
+  test("a revoked or wrong credential is refused, not returned as an empty token", async () => {
+    const { fetchImpl } = appFetchStub({ token: null });
+    await assert.rejects(installationToken(42, "jwt", fetchImpl), /App credential may be wrong or revoked/);
+  });
+
+  test("appToken chains all three calls end to end", async () => {
+    const { fetchImpl } = appFetchStub();
+    const token = await appToken({ appId: "1", privateKey: "k", repo: "example/repo" }, fetchImpl, stubSign);
+    assert.equal(token, "inst-token");
+  });
+
+  test("missing either half of the credential is refused before any request is made", async () => {
+    const { fetchImpl, calls } = appFetchStub();
+    await assert.rejects(
+      appToken({ appId: "", privateKey: "k", repo: "example/repo" }, fetchImpl, stubSign),
+      /needs both app-id and app-private-key/,
+    );
+    await assert.rejects(
+      appToken({ appId: "1", privateKey: "", repo: "example/repo" }, fetchImpl, stubSign),
+      /needs both app-id and app-private-key/,
+    );
+    assert.deepEqual(calls, []);
+  });
+});
+
+describe("the commit a status belongs on", () => {
+  test("pull_request and pull_request_target both read the event snapshot's head", () => {
+    for (const event of ["pull_request", "pull_request_target"]) {
+      assert.equal(statusSha({ event, snapshot: { head: "abc" }, sha: "wrong" }), "abc");
+    }
+  });
+
+  test("never GITHUB_SHA for either -- under pull_request_target that is the BASE tip", () => {
+    assert.throws(
+      () => statusSha({ event: "pull_request_target", snapshot: null, sha: "basetip" }),
+      /refusing to post a status for an unresolved commit/,
+    );
+  });
+
+  test("workflow_dispatch (and anything else) uses GITHUB_SHA directly", () => {
+    assert.equal(statusSha({ event: "workflow_dispatch", snapshot: null, sha: "dispatched-sha" }), "dispatched-sha");
+  });
+});
+
+describe("posting the lanes status", () => {
+  test("posts the expected state, context, and truncated description", async () => {
+    const { fetchImpl, calls } = appFetchStub();
+    await publishStatus(
+      {
+        repo: "example/repo",
+        sha: "abc123",
+        state: "success",
+        description: "x".repeat(200),
+        targetUrl: "https://example.com/run/1",
+      },
+      "inst-token",
+      fetchImpl,
+    );
+    assert.equal(calls[0].path, "/repos/example/repo/statuses/abc123");
+    assert.equal(calls[0].headers.authorization, "Bearer inst-token");
+    const body = JSON.parse(calls[0].body);
+    assert.equal(body.state, "success");
+    assert.equal(body.context, "lanes");
+    // The Statuses API's own cap; a longer description is rejected outright.
+    assert.equal(body.description.length, 140);
+    assert.equal(body.target_url, "https://example.com/run/1");
+  });
+
+  test("a rejected post is refused, not silently dropped", async () => {
+    const { fetchImpl } = appFetchStub({ statusOk: false });
+    await assert.rejects(
+      publishStatus({ repo: "example/repo", sha: "s", state: "success" }, "t", fetchImpl),
+      /Could not post the lanes status/,
+    );
+  });
+});
+
+describe("init mode: publishing pending", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lanes-publish-"));
+  const eventPath = join(dir, "event.json");
+  writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 1, head: { sha: "headsha" }, base: { ref: "main", sha: "basesha" } } }));
+  const env = {
+    GITHUB_EVENT_NAME: "pull_request_target",
+    GITHUB_EVENT_PATH: eventPath,
+    GITHUB_REPOSITORY: "example/repo",
+    GITHUB_SHA: "basetip-not-the-pr", // must NOT end up in the posted status
+  };
+
+  test("posts pending on the event's own head, not GITHUB_SHA", async () => {
+    const { fetchImpl, calls } = appFetchStub();
+    await publishPending(env, { appId: "1", privateKey: "k" }, fetchImpl, stubSign);
+    const statusCall = calls.find((c) => c.path.includes("/statuses/"));
+    assert.equal(statusCall.path, "/repos/example/repo/statuses/headsha");
+    assert.equal(JSON.parse(statusCall.body).state, "pending");
+  });
+
+  test("an App that cannot authenticate refuses rather than posting nothing silently", async () => {
+    const { fetchImpl } = appFetchStub({ installation: null });
+    await assert.rejects(publishPending(env, { appId: "1", privateKey: "k" }, fetchImpl, stubSign));
+  });
+});
+
+describe("gate mode: publishing the terminal result", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lanes-publish-"));
+  const eventPath = join(dir, "event.json");
+  writeFileSync(eventPath, JSON.stringify({ pull_request: { number: 1, head: { sha: "headsha" }, base: { ref: "main", sha: "basesha" } } }));
+  const env = {
+    GITHUB_EVENT_NAME: "pull_request_target",
+    GITHUB_EVENT_PATH: eventPath,
+    GITHUB_REPOSITORY: "example/repo",
+  };
+
+  test("no gate error posts success and returns without throwing", async () => {
+    const { fetchImpl, calls } = appFetchStub();
+    await publishResult(env, null, { appId: "1", privateKey: "k" }, fetchImpl, stubSign);
+    const statusCall = calls.find((c) => c.path.includes("/statuses/"));
+    const body = JSON.parse(statusCall.body);
+    assert.equal(body.state, "success");
+  });
+
+  test("a gate error posts failure and is still re-thrown -- the status is additional, not instead", async () => {
+    const { fetchImpl, calls } = appFetchStub();
+    const err = new PolicyError("heavy jobs did not all succeed");
+    await assert.rejects(
+      publishResult(env, err, { appId: "1", privateKey: "k" }, fetchImpl, stubSign),
+      /heavy jobs did not all succeed/,
+    );
+    const statusCall = calls.find((c) => c.path.includes("/statuses/"));
+    const body = JSON.parse(statusCall.body);
+    assert.equal(body.state, "failure");
+    assert.equal(body.description, "heavy jobs did not all succeed");
+  });
+
+  test("a publish failure is surfaced, never swallowed behind a real gate failure", async () => {
+    const { fetchImpl } = appFetchStub({ installation: null });
+    const err = new PolicyError("heavy jobs did not all succeed");
+    await assert.rejects(
+      publishResult(env, err, { appId: "1", privateKey: "k" }, fetchImpl, stubSign),
+      /heavy jobs did not all succeed.*additionally, could not publish/s,
+    );
+  });
+
+  test("a publish failure alone (gate itself passed) is not swallowed either", async () => {
+    const { fetchImpl } = appFetchStub({ installation: null });
+    await assert.rejects(
+      publishResult(env, null, { appId: "1", privateKey: "k" }, fetchImpl, stubSign),
+      /is it installed there/,
+    );
   });
 });

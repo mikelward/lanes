@@ -159,6 +159,69 @@ never reports on the docs lane, so nothing merges.
 `permissions: contents: read` and `pull-requests: read` are enough; the engine
 writes nothing.
 
+### Trusted publishing
+
+The template above trusts the ambient Actions check-run to report `lanes`'s
+own pass/fail -- which is only as trustworthy as the job DEFINITION that
+produced it, and under plain `pull_request` that definition is the pull
+request's own copy. A pull request touching its own workflow file can rewrite
+the `lanes` job to `exit 0`.
+
+`mode: init` and two new inputs, `app-id`/`app-private-key`, are the
+alternative: authenticate as a dedicated GitHub App and post the `lanes`
+commit status directly, by API call, onto the exact commit the triggering
+event named -- never trusting whichever commit the ambient check-run happens
+to attribute a job to. Supply neither input and nothing changes: `gate` mode
+behaves exactly as it always has. Supply both and `gate` mode additionally
+publishes the terminal status this way, and a new no-checkout `init` job (no
+`needs:`, first in the graph) posts `pending` before anything else runs:
+
+```yaml
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - uses: mikelward/lanes@main
+        with:
+          mode: init
+          app-id: ${{ secrets.LANES_APP_ID }}
+          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}
+
+  # ... classify and your heavy jobs, as above ...
+
+  lanes:
+    name: lanes
+    needs: [init, classify, check, msrv]
+    if: ${{ !cancelled() }}
+    permissions:
+      statuses: write
+      pull-requests: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with: { persist-credentials: false }
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+          # ...same inputs as above, plus:
+          app-id: ${{ secrets.LANES_APP_ID }}
+          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}
+```
+
+**This is the mechanism, not yet the whole pattern.** The App credential must
+live in a GitHub Environment restricted to your trusted base ref, never a
+bare repository or organization secret -- a same-repo pull request's own
+`push`-triggered workflow can read a bare secret exactly as the legitimate
+jobs do. And publishing the status correctly is only half of what a
+`pull_request_target`-based rollout needs: `classify` and every heavy job
+still have to move to that trigger too, check out the merge snapshot rather
+than the head, and reference no `secrets.*` anywhere, or the tampering this
+exists to close reopens one hop over. See `TODO.md` for what is proven here
+and what is still open before rolling this out on a consumer.
+
 ### Renaming an existing consumer's check
 
 The instruction above is for a fresh install. An existing consumer whose

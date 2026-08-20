@@ -294,6 +294,49 @@
         whole design section describes should be understood as unproven
         against the exact self-certification threat it exists to close.
 
+      **Round eight: the engine capability itself now exists, resolving the
+      "unproven" line above at the mechanism level, not at the rollout
+      level.** `lanes.mjs` gained a `publishing` layer: `signAppJwt` (a
+      short-lived App JWT, RS256, Node's own `node:crypto`, no dependency),
+      `installationId`/`installationToken` (the JWT-then-installation-token
+      exchange GitHub's own App-auth flow requires), and `publishStatus`
+      (posts the `lanes` context directly via `repos.createCommitStatus` on
+      the commit `statusSha` resolves from the event payload — never
+      `GITHUB_SHA`, which is the base tip under `pull_request_target`, not
+      the pull request). Two new callers: a new `init` mode does nothing but
+      resolve the commit and post `pending`, exactly the initializer this
+      file already specified, with no checkout, no policy read, and no
+      binding verification, since `pending` never satisfies a required check
+      either way; `gate` mode grew an opt-in second half (`publishResult`)
+      that publishes the terminal state after computing the verdict as
+      before, then re-throws whatever `gate()` threw so the job's own log
+      still reports red — the status is IN ADDITION to that, never instead
+      of it. Both are gated on `app-id`/`app-private-key` being supplied at
+      all: a consumer that supplies neither is completely unaffected, and
+      keeps relying on the ambient Actions check-run exactly as it does
+      today. All of it is unit-tested against a stubbed API, plus one real
+      RSA round trip that signs a JWT and verifies its signature against the
+      matching public key — the one place this file's claim about GitHub's
+      own auth flow is checked against something other than description.
+
+      **What round eight does NOT resolve, and is still open:** the
+      workflow-level rollout this mechanism exists to serve. Nothing yet
+      moves `classify` or a consumer's heavy jobs to `pull_request_target`,
+      builds the merge snapshot instead of the head, enforces the
+      no-`secrets.*`-in-a-heavy-job rule, orders the initializer ahead of
+      `classify`/the finalizer with `needs:`, or adds the
+      `concurrency`/`cancel-in-progress` group and the finalizer's
+      `!cancelled()` condition — all four are still consumer-workflow work,
+      not engine work, and belong to whichever pull request actually pilots
+      a consumer onto this. The `actions/cache` poisoning item from round
+      six is untouched and still has no answer. And the one platform fact
+      this whole design leans on — that a `pull_request_target` run's
+      `github.ref` genuinely resolves to the base branch, which is what an
+      environment's branch-policy restriction is trusted to act on — remains
+      unverified against live docs, exactly as flagged above; nothing in
+      this round depended on it, since the publishing layer reasons entirely
+      from the event payload and the API, never from `GITHUB_REF`.
+
       **Alternatives considered and why they are not the design:**
       - GitHub rulesets have a "require workflows to pass" rule type that
         may pin a required workflow's source independently of the PR
