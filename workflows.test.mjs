@@ -119,6 +119,34 @@ describe("the README's consumer template", () => {
     assert.match(usage, /Then require \*\*`lanes`\*\* — and only `lanes` —/);
     assert.doesNotMatch(usage, /Then require \*\*`gate`\*\*/);
   });
+
+  // Both publisher jobs in this snippet were caught missing `runs-on` and
+  // `environment:` on the first pass -- a workflow GitHub rejects outright,
+  // and a secret invisible to the job that reads it, respectively, neither
+  // of them an error a copy-paster would see coming. Pinned so a future edit
+  // to this example cannot lose either one silently.
+  const trustedPublishing = readme.slice(
+    readme.indexOf("### Trusted publishing"),
+    readme.indexOf("### Renaming an existing consumer's check"),
+  );
+
+  test("the trusted-publishing example exists and both jobs can actually run", () => {
+    assert.notEqual(trustedPublishing.indexOf("### Trusted publishing"), -1, "Trusted publishing section not found");
+    assert.match(trustedPublishing, /\n {2}init:\n {4}runs-on: ubuntu-latest\n/);
+    assert.match(trustedPublishing, /\n {2}lanes:\n {4}name: lanes\n {4}runs-on: ubuntu-latest\n/);
+  });
+
+  test("the trusted-publishing example attaches BOTH jobs to the restricted environment", () => {
+    // Not "a" job -- an environment-scoped secret is invisible to any job
+    // that doesn't itself declare `environment:`, so a consumer's App
+    // credential silently resolves empty on whichever job the example
+    // forgot, exactly the shape of the finding this test pins.
+    const jobBlocks = trustedPublishing.split(/\n {2}(?=init:|lanes:)/).slice(1);
+    assert.equal(jobBlocks.length, 2, "expected exactly the init and lanes job blocks");
+    for (const block of jobBlocks) {
+      assert.match(block, /\n {4}environment: lanes\n/, `job block missing environment::\n${block}`);
+    }
+  });
 });
 
 describe("the zizmor workflow", () => {

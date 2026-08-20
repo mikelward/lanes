@@ -181,6 +181,7 @@ jobs:
   init:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    environment: lanes
     permissions:
       statuses: write
     steps:
@@ -194,8 +195,11 @@ jobs:
 
   lanes:
     name: lanes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: [init, classify, check, msrv]
     if: ${{ !cancelled() }}
+    environment: lanes
     permissions:
       statuses: write
       pull-requests: read
@@ -210,6 +214,14 @@ jobs:
           app-id: ${{ secrets.LANES_APP_ID }}
           app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}
 ```
+
+**Both jobs above declare `environment: lanes`, and that is not optional.**
+Without it, an environment-scoped secret is invisible to the job regardless
+of what the workflow references -- `init` fails authentication outright, and
+`gate` silently falls back to the ambient check-run instead of publishing
+through the App, defeating the whole mechanism with no error to notice it by.
+Name the environment whatever you like, but every job reading either secret
+needs it, not just the one that happens to be listed first.
 
 **This is the mechanism, not yet the whole pattern.** The App credential must
 live in a GitHub Environment restricted to your trusted base ref, never a
