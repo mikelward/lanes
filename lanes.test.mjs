@@ -36,6 +36,7 @@ import {
   eventSnapshot,
   stillPinned,
   baseTip,
+  defaultBranch,
   signAppJwt,
   installationId,
   installationToken,
@@ -63,6 +64,7 @@ function stub({
   baseRef = "main",
   tip = "basetip",
   compare = "ahead",
+  defaultBranchName = "main",
 } = {}) {
   const routes = [
     [/\/pulls\/\d+\/files/, () => files],
@@ -70,6 +72,9 @@ function stub({
     [/\/commits\/[^/]+\/pulls/, () => pulls ?? [{ state: "open", head: { sha: headSha }, number: 1 }]],
     [/\/git\/ref\/heads\//, () => ({ object: { sha: tip } })],
     [/\/compare\//, () => ({ status: compare })],
+    // A bare `/repos/owner/repo` -- nothing after it -- is the repository
+    // object itself, the only route `defaultBranch` calls.
+    [/^\/repos\/[^/]+\/[^/]+$/, () => ({ default_branch: defaultBranchName })],
     [
       /\/pulls\/\d+$/,
       () => ({
@@ -225,27 +230,25 @@ describe("policy parsing", () => {
     assert.throws(() => parsePolicy("docs *.md\n"), /sets no prefixes/);
   });
 
-  test("dispatch-without-pr takes refuse, allow, or allow-on <branch>", () => {
+  test("dispatch-without-pr takes refuse, allow, or allow-on-default-branch", () => {
     assert.deepEqual(parsePolicy("docs *.md\nprefixes docs\n").dispatchWithoutPr, { mode: "refuse" });
     assert.deepEqual(
       parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow\n").dispatchWithoutPr,
       { mode: "allow" },
     );
     assert.deepEqual(
-      parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow-on main\n").dispatchWithoutPr,
-      { mode: "allow-on", ref: "main" },
+      parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow-on-default-branch\n").dispatchWithoutPr,
+      { mode: "allow-on-default-branch" },
     );
     assert.throws(
       () => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr maybe\n"),
-      /takes refuse, allow, or allow-on/,
+      /takes refuse, allow, or allow-on-default-branch/,
     );
+    // No argument, on purpose: a policy-supplied branch name is exactly the
+    // untrusted input this mode exists to avoid -- see `defaultBranch`.
     assert.throws(
-      () => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow-on\n"),
-      /needs exactly one branch name/,
-    );
-    assert.throws(
-      () => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow-on main topic\n"),
-      /needs exactly one branch name/,
+      () => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow-on-default-branch main\n"),
+      /takes no argument/,
     );
     assert.throws(
       () => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow extra\n"),
@@ -388,28 +391,48 @@ describe("binding a run to its own pull request", () => {
     );
   });
 
-  test("allow-on restricts a PR-less dispatch to one ref, unlike bare allow", async () => {
+  test("allow-on-default-branch restricts a PR-less dispatch to the API's own default branch", async () => {
     // The gap this closes: `allow` accepts a PR-less dispatch against ANY
     // ref, including a pull request's own branch -- which runs that
     // branch's own, possibly-tampered copy of this workflow, and the
-    // resulting ambient check-run lands on the PR's own head. `allow-on`
-    // is how a maintainer's release-force dispatch (no PR, always against
-    // the default branch) stays possible without reopening that.
+    // resulting ambient check-run lands on the PR's own head.
+    // `allow-on-default-branch` is how a maintainer's release-force
+    // dispatch (no PR, always against the default branch) stays possible
+    // without reopening that.
     const env = {
       event: "workflow_dispatch",
       pr: "",
-      dispatchWithoutPr: { mode: "allow-on", ref: "main" },
+      dispatchWithoutPr: { mode: "allow-on-default-branch" },
     };
     await assert.doesNotReject(
-      verifyDispatchBinding({ ...env, ref: "refs/heads/main" }, ctx({})),
+      verifyDispatchBinding({ ...env, ref: "refs/heads/main" }, ctx({ defaultBranchName: "main" })),
     );
     await assert.rejects(
-      verifyDispatchBinding({ ...env, ref: "refs/heads/some-pr-branch" }, ctx({})),
+      verifyDispatchBinding({ ...env, ref: "refs/heads/some-pr-branch" }, ctx({ defaultBranchName: "main" })),
       /only allowed on 'refs\/heads\/main'/,
     );
     await assert.rejects(
-      verifyDispatchBinding({ ...env, ref: undefined }, ctx({})),
+      verifyDispatchBinding({ ...env, ref: undefined }, ctx({ defaultBranchName: "main" })),
       /this run's ref is '<unset>'/,
+    );
+  });
+
+  test("the allowed branch comes from the API, never from anything a dispatched branch could name", async () => {
+    // Exactly the finding this design replaced: an earlier `allow-on
+    // <branch>` let the POLICY name the trusted ref, and that policy is
+    // read from the dispatched branch's own checkout -- so an attacker's
+    // own branch could simply name itself. Proven here by having the repo's
+    // real default branch be something other than what a malicious local
+    // policy might have claimed, and confirming only the real one passes.
+    const env = {
+      event: "workflow_dispatch",
+      pr: "",
+      dispatchWithoutPr: { mode: "allow-on-default-branch" },
+      ref: "refs/heads/attacker-controlled-branch",
+    };
+    await assert.rejects(
+      verifyDispatchBinding(env, ctx({ defaultBranchName: "release" })),
+      /only allowed on 'refs\/heads\/release'/,
     );
   });
 
@@ -1125,6 +1148,27 @@ describe("reading a base branch's tip", () => {
     // different ref entirely, while the slashes are real separators.
     await baseTip("feature/a#b", spy);
     assert.match(seen[0], /\/git\/ref\/heads\/feature\/a%23b$/);
+  });
+});
+
+describe("reading the repository's own default branch", () => {
+  test("hits the bare repository endpoint, not anything local", async () => {
+    const seen = [];
+    const spy = {
+      token: "t",
+      repo: "example/repo",
+      fetchImpl: async (url) => {
+        seen.push(new URL(url).pathname);
+        return { ok: true, status: 200, json: async () => ({ default_branch: "release" }) };
+      },
+    };
+    assert.equal(await defaultBranch(spy), "release");
+    assert.equal(seen[0], "/repos/example/repo");
+  });
+
+  test("a failed lookup is refused, not treated as an empty/unset branch", async () => {
+    const spy = { token: "t", repo: "example/repo", fetchImpl: async () => ({ ok: false, status: 404 }) };
+    await assert.rejects(defaultBranch(spy), /Could not read this repository's default branch/);
   });
 });
 

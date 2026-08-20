@@ -61,10 +61,13 @@ prefixes design docs todo test build refactor
 
 # Optional; defaults to refuse. `allow` accepts a PR-less dispatch against
 # ANY ref -- including a pull request's own branch, running that branch's own
-# copy of this workflow -- so prefer `allow-on <branch>` (e.g. `allow-on
-# main`) for the one legitimate case, a maintainer's release-force dispatch
-# with no pull request to name, restricted to the one ref that's actually
-# trusted.
+# copy of this workflow -- so prefer `allow-on-default-branch` for the one
+# legitimate case, a maintainer's release-force dispatch with no pull request
+# to name. It takes no argument: the allowed branch is always the
+# repository's own default, fetched fresh from the API at verification time
+# -- never a name this file supplies, because this file itself is read from
+# whatever branch the dispatch checked out, and a policy-named branch would
+# let an attacker's own branch simply name itself.
 dispatch-without-pr refuse
 
 # Optional; defaults to YES. Whether the PULL REQUEST TITLE must carry a prefix

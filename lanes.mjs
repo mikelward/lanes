@@ -145,12 +145,20 @@ export function parsePolicy(text) {
         // describes -- a dispatch against a PR's own branch, naming no PR,
         // runs that branch's own (possibly rewritten) copy of the workflow,
         // and the resulting ambient check-run lands on the PR's own head.
-        // `allow-on <branch>` is the scoped alternative: a maintainer's
-        // PR-less dispatch (a release-force button, say) restricted to one
-        // trusted branch, matching what a hand-rolled predecessor of this
-        // engine already enforced in more than one consumer before it moved
-        // here. `allow` still parses, for a consumer that already relies on
-        // it, but `allow-on` is what a new policy should reach for.
+        //
+        // `allow-on-default-branch` is the scoped alternative, and it takes
+        // NO argument on purpose -- an EARLIER version of this let the policy
+        // name the trusted branch (`allow-on <branch>`), and that is broken:
+        // for a dispatch against a non-default branch, .github/lanes.conf is
+        // read from THAT branch's own checkout, so an attacker's own policy
+        // could simply name their own branch as the allowed one, satisfying
+        // a check whose only job was to refuse exactly that. There is no
+        // branch name a policy file can supply that isn't subject to this,
+        // because the policy and the ref it would be compared against always
+        // come from the same untrusted checkout. The only safe source is the
+        // one thing that checkout cannot set: the repository's own default
+        // branch, fetched fresh from the API at verification time (see
+        // `defaultBranch`), never taken from anything local.
         const [mode, ...modeArgs] = rest;
         if (mode === "refuse") {
           if (modeArgs.length > 0) {
@@ -163,21 +171,23 @@ export function parsePolicy(text) {
           if (modeArgs.length > 0) {
             throw new PolicyError(
               `${POLICY_PATH}:${lineno}: 'dispatch-without-pr allow' takes no further argument -- ` +
-                `did you mean 'allow-on <branch>', which restricts it to one ref?`,
+                `did you mean 'allow-on-default-branch'?`,
             );
           }
           dispatchWithoutPr = { mode: "allow" };
-        } else if (mode === "allow-on") {
-          if (modeArgs.length !== 1 || !modeArgs[0]) {
+        } else if (mode === "allow-on-default-branch") {
+          if (modeArgs.length > 0) {
             throw new PolicyError(
-              `${POLICY_PATH}:${lineno}: 'dispatch-without-pr allow-on' needs exactly one branch name.`,
+              `${POLICY_PATH}:${lineno}: 'dispatch-without-pr allow-on-default-branch' takes no ` +
+                `argument -- the branch is the repository's own default, verified via the API, never ` +
+                `a name the policy supplies.`,
             );
           }
-          dispatchWithoutPr = { mode: "allow-on", ref: modeArgs[0] };
+          dispatchWithoutPr = { mode: "allow-on-default-branch" };
         } else {
           throw new PolicyError(
-            `${POLICY_PATH}:${lineno}: 'dispatch-without-pr' takes refuse, allow, or allow-on <branch>, ` +
-              `not '${argument}'.`,
+            `${POLICY_PATH}:${lineno}: 'dispatch-without-pr' takes refuse, allow, or ` +
+              `allow-on-default-branch, not '${argument}'.`,
           );
         }
         break;
@@ -348,6 +358,31 @@ export async function baseMovement(pinnedSha, ref, ctx) {
   // otherwise return up to 250 commits to answer a yes/no question.
   const cmp = await api(`compare/${pinnedSha}...${tip}?per_page=1`, ctx);
   return { tip, advancedOnly: cmp.status === "ahead" || cmp.status === "identical" };
+}
+
+/**
+ * The repository's own default branch, fetched fresh via the API.
+ *
+ * Never taken from the policy, or from anything else in a local checkout: a
+ * `workflow_dispatch` against a non-default branch checks out that branch's
+ * own tree, so a value read from there is exactly as untrusted as the ref
+ * `dispatch-without-pr allow-on-default-branch` exists to restrict. The
+ * repository object itself is the one answer a dispatched branch's own
+ * content cannot supply.
+ */
+export async function defaultBranch(ctx) {
+  const fetchImpl = ctx.fetchImpl || fetch;
+  const res = await fetchImpl(`https://api.github.com/repos/${ctx.repo}`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${ctx.token}`,
+      "x-github-api-version": "2022-11-28",
+    },
+  });
+  if (!res.ok) {
+    throw new PolicyError(`Could not read this repository's default branch (GitHub API ${res.status}).`);
+  }
+  return (await res.json()).default_branch;
 }
 
 /**
@@ -616,8 +651,9 @@ export async function verifyDispatchBinding({ event, pr, sha, ref, dispatchWitho
   if (event !== "workflow_dispatch") return null;
   if (!pr) {
     if (dispatchWithoutPr.mode === "allow") return null;
-    if (dispatchWithoutPr.mode === "allow-on") {
-      const expected = `refs/heads/${dispatchWithoutPr.ref}`;
+    if (dispatchWithoutPr.mode === "allow-on-default-branch") {
+      // Fetched fresh, not read from the checkout: see `defaultBranch`.
+      const expected = `refs/heads/${await defaultBranch(ctx)}`;
       if (ref === expected) return null;
       throw new PolicyError(
         `A dispatched run with no pull request is only allowed on '${expected}', but this run's ref is ` +
