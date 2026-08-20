@@ -214,26 +214,32 @@ jobs:
           app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}
 ```
 
-**Require `init`, `finalize`, AND the App-posted `lanes` status -- not `lanes`
-alone.** Neither `init` nor `gate` mode swallows a failure to authenticate or
-to publish: both re-throw, so the job that hit it reports red in its own
-Actions check-run regardless of what happened to the `lanes` status context.
-That matters because the `lanes` status only changes when a run successfully
-POSTS a new one. A run whose App credential has gone bad -- revoked,
-expired, the App uninstalled -- can neither post `pending` nor a fresh
-verdict, so whatever `lanes: success` a PREVIOUS, healthy run already posted
-on that commit simply stands, un-revalidated, and a ruleset requiring only
-`lanes` would accept it. `init` and `finalize` are each a job DEFINITION that
-loads from the base branch under `pull_request_target`, exactly like `lanes`
-itself, so requiring them too costs nothing a same-repo pull request could
-forge, and turns "the publisher silently couldn't refresh anything" into a
-required check that is directly, unambiguously red. The job is named
-`finalize` rather than `lanes` specifically so its own check-run is never
-confused with the App-posted status of the same name -- requiring both
-under one shared name is not something to rely on without verifying how
-your ruleset's UI disambiguates two checks with identical names from
-different sources, which this repository has not verified against live
-docs (see `TODO.md`).
+**Require only the App-posted `lanes` status -- never `init` or `finalize`'s
+own Actions check-run.** It is tempting to require those too, on the
+reasoning that neither mode swallows a failure to authenticate or publish
+(both re-throw), so the job that hit it reports red -- and an earlier
+revision of this section said exactly that. It is wrong, and the reason is
+the same fact this whole design already turns on: under `pull_request_target`
+GitHub attributes a job's own ambient check-run to `GITHUB_SHA`, which is the
+BASE branch's tip, not the pull request's head. Requiring `init` or
+`finalize` by name would leave the pull request's own head waiting forever
+for a check that only ever reports on `main`'s tip -- blocking every merge
+through this pattern, not protecting it. The job is still named `finalize`
+rather than `lanes`, so its own check-run in the Actions tab is never
+visually confused with the App-posted status of the same name, but that
+check-run is not, and cannot be, part of what the ruleset requires.
+
+**This leaves one gap genuinely open, not solved.** A run whose App
+credential has gone bad -- revoked, expired, the App uninstalled -- cannot
+post `pending` or a fresh verdict at all, so whatever `lanes: success` a
+PREVIOUS, healthy run already posted on that commit simply stands,
+un-revalidated, across a retarget or title edit that should have started a
+fresh one. There is no App-authenticated signal available to close this: the
+only thing the App can write is the `lanes` status itself, and minting the
+token to write it is exactly what is failing. Watch `init`/`finalize`'s own
+job failures in the Actions tab (or wire a notification to them) as an
+operational signal instead -- they are real and visible there, just not
+something a required check can act on. See `TODO.md`.
 
 **Both jobs above declare `environment: lanes`, and that is not optional.**
 Without it, an environment-scoped secret is invisible to the job regardless

@@ -349,23 +349,41 @@
       whatever `lanes: success` a previous, healthy run already posted on
       that commit simply stands, and a ruleset requiring `lanes` alone
       accepts it -- even across a retarget or title edit that should have
-      started a fresh, unvalidated verdict. The README's example now
-      instructs requiring `init` and the finalizer job (renamed `finalize`,
-      away from `lanes`, specifically so its own check-run is never confused
-      with the App-posted status of the same name) ALONGSIDE the App-posted
-      `lanes` status -- both job definitions load from the base branch under
-      `pull_request_target` exactly like `lanes` itself, so requiring them
-      costs nothing a same-repo pull request could forge, and turns "the
-      publisher silently couldn't refresh anything" into a required check
-      that is directly red rather than an absence of change. Two things this
-      does NOT close, both left open rather than asserted past what is
-      known: whether a ruleset actually disambiguates two same-named checks
-      from different sources cleanly is exactly why the finalizer was
-      renamed rather than relied on to coexist with `lanes` under one name;
-      and the underlying "first-write latency" window this design has
-      flagged since round three -- the gap between a new event firing and
-      its own fresh status actually landing -- still is not, and cannot be,
-      closed to zero by anything here.
+      started a fresh, unvalidated verdict.
+
+      **The first fix attempted (superseded within the same round) was
+      wrong, and worth recording rather than erasing.** It instructed
+      requiring `init` and the finalizer job (renamed `finalize`, away from
+      `lanes`, so its own check-run is never confused with the App-posted
+      status of the same name) ALONGSIDE the App-posted `lanes` status, on
+      the reasoning that both job definitions load from the base branch
+      under `pull_request_target` exactly like `lanes` itself, so requiring
+      them costs nothing a same-repo pull request could forge. That reasoning
+      is correct about the job DEFINITION and wrong about what a required
+      check actually reads: GitHub attributes a `pull_request_target` job's
+      own ambient check-run to `GITHUB_SHA`, which is the BASE branch's tip,
+      not the pull request's head -- the identical fact the second superseded
+      design attempt above was rejected over. Requiring `init` or `finalize`
+      by name would have left every pull request's own head waiting forever
+      for a check that only ever reports against `main`, blocking every merge
+      through this pattern rather than protecting it. Caught by the same
+      round of review before merging, and reverted.
+
+      **What stands instead: `lanes` alone remains the only required check,
+      and the stale-status gap is left open rather than falsely closed.**
+      There is no App-authenticated signal available to fix it -- the only
+      thing the App can write at all is the `lanes` status itself, and
+      minting the token to write it is exactly what is failing when this gap
+      is live. `init`/`finalize`'s own job failures are real and visible in
+      the Actions tab (or a notification wired to them), which is an
+      operational mitigation, not one a required check can enforce. The
+      finalizer keeps its `finalize` name regardless, purely so its check-run
+      in the Actions tab is not visually confused with the status of the same
+      name -- that naming choice was never the part that was wrong. The
+      underlying "first-write latency" window this design has flagged since
+      round three -- the gap between a new event firing and its own fresh
+      status actually landing -- remains untouched by any of this and still
+      is not, and cannot be, closed to zero by anything here.
 
       **Alternatives considered and why they are not the design:**
       - GitHub rulesets have a "require workflows to pass" rule type that
