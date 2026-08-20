@@ -144,12 +144,20 @@ describe("the README's consumer template", () => {
     assert.doesNotMatch(trustedPublishing, /\n {2}lanes:\n/);
   });
 
-  test("the ruleset instruction requires init and finalize alongside the App-posted status, not lanes alone", () => {
-    // Neither publish call swallows a failure -- both re-throw -- but a run
-    // whose App credential has gone bad cannot post ANYTHING, so a stale
-    // `lanes: success` from a healthy earlier run stands un-revalidated
-    // unless something else visible to the ruleset also went red.
-    assert.match(trustedPublishing, /Require `init`, `finalize`, AND the App-posted `lanes` status/);
+  test("never instructs requiring init or finalize's own check-run", () => {
+    // A tempting-looking fix, and wrong: under pull_request_target GitHub
+    // attributes a job's ambient check-run to GITHUB_SHA, which is the BASE
+    // branch's tip -- so requiring either job by name would leave the pull
+    // request's own head waiting forever for a check that only ever reports
+    // on main, blocking every merge through this pattern rather than
+    // protecting it. This was tried and reverted; pinned so it is not
+    // tried again the same way.
+    assert.doesNotMatch(trustedPublishing, /[Rr]equire `init`/);
+    assert.doesNotMatch(trustedPublishing, /[Rr]equire `finalize`/);
+  });
+
+  test("names the stale-status gap as open rather than claiming a fix that doesn't exist", () => {
+    assert.match(trustedPublishing, /genuinely open, not solved/);
   });
 
   test("the trusted-publishing example attaches BOTH jobs to the restricted environment", () => {
