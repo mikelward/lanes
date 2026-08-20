@@ -35,6 +35,7 @@ import {
   verifyPrBinding,
   eventSnapshot,
   stillPinned,
+  stillUnclaimed,
   baseTip,
   defaultBranch,
   signAppJwt,
@@ -402,6 +403,7 @@ describe("binding a run to its own pull request", () => {
     const env = {
       event: "workflow_dispatch",
       pr: "",
+      sha: "maintip",
       dispatchWithoutPr: { mode: "allow-on-default-branch" },
     };
     await assert.doesNotReject(
@@ -414,6 +416,28 @@ describe("binding a run to its own pull request", () => {
     await assert.rejects(
       verifyDispatchBinding({ ...env, ref: undefined }, ctx({ defaultBranchName: "main" })),
       /this run's ref is '<unset>'/,
+    );
+  });
+
+  test("allow-on-default-branch refuses a default-branch tip that also heads an open pull request", async () => {
+    // A promote-to-release PR opened straight from the default branch's
+    // current tip (or one simply caught up to it) means that commit heads
+    // an open pull request too. A status is per-commit -- a "no pull
+    // request here" verdict published for it would satisfy that PR's
+    // required check without its diff ever being classified or bound.
+    const env = {
+      event: "workflow_dispatch",
+      pr: "",
+      sha: "maintip",
+      ref: "refs/heads/main",
+      dispatchWithoutPr: { mode: "allow-on-default-branch" },
+    };
+    await assert.rejects(
+      verifyDispatchBinding(
+        env,
+        ctx({ defaultBranchName: "main", pulls: [{ state: "open", head: { sha: "maintip" }, number: 7 }] }),
+      ),
+      /heads open pull request\(s\) \[7\]/,
     );
   });
 
@@ -580,6 +604,37 @@ describe("gate", () => {
   test("a skip on a policy edit is refused", async () => {
     const policyEdit = ctx({ files: named(POLICY_PATH), commits: [{ parents: [{}], commit: { message: "docs: x" } }] });
     await assert.rejects(gate(skipped, POLICY, policyEdit), /refusing the skip/);
+  });
+});
+
+describe("gate re-verifies a PR-less dispatch's commit immediately before publishing", () => {
+  // pin is null throughout, exactly as verifyDispatchBinding leaves it for
+  // this path -- there is nothing to pin a PR-less dispatch TO.
+  const dispatchGreen = {
+    event: "workflow_dispatch",
+    pr: "",
+    sha: "maintip",
+    classifyResult: "success",
+    results: "check=success msrv=success",
+  };
+
+  test("a commit that heads no open pull request passes", async () => {
+    await assert.doesNotReject(gate(dispatchGreen, POLICY, ctx({ files: named("src/a.rs") })));
+  });
+
+  test("a commit claimed by an open pull request between bind time and publish is refused", async () => {
+    // verifyDispatchBinding already checked this once, before the heavy
+    // jobs ran; gate() repeats it right before publishing because a pull
+    // request can appear in between -- the same settle-before-report
+    // discipline stillPinned already applies to the PR-bound path.
+    await assert.rejects(
+      gate(
+        dispatchGreen,
+        POLICY,
+        ctx({ files: named("src/a.rs"), pulls: [{ state: "open", head: { sha: "maintip" }, number: 9 }] }),
+      ),
+      /heads open pull request\(s\) \[9\]/,
+    );
   });
 });
 
