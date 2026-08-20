@@ -133,7 +133,23 @@ describe("the README's consumer template", () => {
   test("the trusted-publishing example exists and both jobs can actually run", () => {
     assert.notEqual(trustedPublishing.indexOf("### Trusted publishing"), -1, "Trusted publishing section not found");
     assert.match(trustedPublishing, /\n {2}init:\n {4}runs-on: ubuntu-latest\n/);
-    assert.match(trustedPublishing, /\n {2}lanes:\n {4}name: lanes\n {4}runs-on: ubuntu-latest\n/);
+    assert.match(trustedPublishing, /\n {2}finalize:\n {4}runs-on: ubuntu-latest\n/);
+  });
+
+  test("the finalizer is named finalize, never lanes -- that name belongs to the App's status", () => {
+    // A job's own check-run and a commit status can share a display name
+    // without this repository having verified how a ruleset disambiguates
+    // them by source; the finalizer is named apart from `lanes` so nothing
+    // here depends on that being resolved correctly.
+    assert.doesNotMatch(trustedPublishing, /\n {2}lanes:\n/);
+  });
+
+  test("the ruleset instruction requires init and finalize alongside the App-posted status, not lanes alone", () => {
+    // Neither publish call swallows a failure -- both re-throw -- but a run
+    // whose App credential has gone bad cannot post ANYTHING, so a stale
+    // `lanes: success` from a healthy earlier run stands un-revalidated
+    // unless something else visible to the ruleset also went red.
+    assert.match(trustedPublishing, /Require `init`, `finalize`, AND the App-posted `lanes` status/);
   });
 
   test("the trusted-publishing example attaches BOTH jobs to the restricted environment", () => {
@@ -141,8 +157,8 @@ describe("the README's consumer template", () => {
     // that doesn't itself declare `environment:`, so a consumer's App
     // credential silently resolves empty on whichever job the example
     // forgot, exactly the shape of the finding this test pins.
-    const jobBlocks = trustedPublishing.split(/\n {2}(?=init:|lanes:)/).slice(1);
-    assert.equal(jobBlocks.length, 2, "expected exactly the init and lanes job blocks");
+    const jobBlocks = trustedPublishing.split(/\n {2}(?=init:|finalize:)/).slice(1);
+    assert.equal(jobBlocks.length, 2, "expected exactly the init and finalize job blocks");
     for (const block of jobBlocks) {
       assert.match(block, /\n {4}environment: lanes\n/, `job block missing environment::\n${block}`);
     }

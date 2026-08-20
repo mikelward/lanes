@@ -193,8 +193,7 @@ jobs:
 
   # ... classify and your heavy jobs, as above ...
 
-  lanes:
-    name: lanes
+  finalize:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [init, classify, check, msrv]
@@ -214,6 +213,27 @@ jobs:
           app-id: ${{ secrets.LANES_APP_ID }}
           app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}
 ```
+
+**Require `init`, `finalize`, AND the App-posted `lanes` status -- not `lanes`
+alone.** Neither `init` nor `gate` mode swallows a failure to authenticate or
+to publish: both re-throw, so the job that hit it reports red in its own
+Actions check-run regardless of what happened to the `lanes` status context.
+That matters because the `lanes` status only changes when a run successfully
+POSTS a new one. A run whose App credential has gone bad -- revoked,
+expired, the App uninstalled -- can neither post `pending` nor a fresh
+verdict, so whatever `lanes: success` a PREVIOUS, healthy run already posted
+on that commit simply stands, un-revalidated, and a ruleset requiring only
+`lanes` would accept it. `init` and `finalize` are each a job DEFINITION that
+loads from the base branch under `pull_request_target`, exactly like `lanes`
+itself, so requiring them too costs nothing a same-repo pull request could
+forge, and turns "the publisher silently couldn't refresh anything" into a
+required check that is directly, unambiguously red. The job is named
+`finalize` rather than `lanes` specifically so its own check-run is never
+confused with the App-posted status of the same name -- requiring both
+under one shared name is not something to rely on without verifying how
+your ruleset's UI disambiguates two checks with identical names from
+different sources, which this repository has not verified against live
+docs (see `TODO.md`).
 
 **Both jobs above declare `environment: lanes`, and that is not optional.**
 Without it, an environment-scoped secret is invisible to the job regardless
