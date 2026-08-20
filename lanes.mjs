@@ -314,6 +314,25 @@ export async function openPrsHeading(sha, ctx) {
 }
 
 /**
+ * A PR-less dispatch's commit must head no open pull request, checked both
+ * before the run is allowed to proceed and again immediately before it
+ * publishes -- a status is per-commit, so a verdict meant to say "no pull
+ * request here" would otherwise satisfy the required check of a pull
+ * request opened (or caught up to this commit) in between, without that
+ * PR's diff ever being classified or bound.
+ */
+export async function stillUnclaimed(sha, ctx) {
+  const heads = await openPrsHeading(sha, ctx);
+  if (heads.length > 0) {
+    throw new PolicyError(
+      `Commit ${sha} heads open pull request(s) [${heads.join(", ")}] — a PR-less dispatch cannot ` +
+        `report for a commit that heads a pull request, since the status would satisfy that pull ` +
+        `request's required check without ever validating its diff.`,
+    );
+  }
+}
+
+/**
  * The live tip of a branch, read from the ref itself rather than from the
  * pull request's cached `base.sha`, so the answer does not depend on how
  * fresh that cache happens to be.
@@ -654,12 +673,23 @@ export async function verifyDispatchBinding({ event, pr, sha, ref, dispatchWitho
     if (dispatchWithoutPr.mode === "allow-on-default-branch") {
       // Fetched fresh, not read from the checkout: see `defaultBranch`.
       const expected = `refs/heads/${await defaultBranch(ctx)}`;
-      if (ref === expected) return null;
-      throw new PolicyError(
-        `A dispatched run with no pull request is only allowed on '${expected}', but this run's ref is ` +
-          `'${ref || "<unset>"}' — a dispatch against any other ref could be running that branch's own, ` +
-          `possibly-tampered copy of this workflow.`,
-      );
+      if (ref !== expected) {
+        throw new PolicyError(
+          `A dispatched run with no pull request is only allowed on '${expected}', but this run's ref is ` +
+            `'${ref || "<unset>"}' — a dispatch against any other ref could be running that branch's own, ` +
+            `possibly-tampered copy of this workflow.`,
+        );
+      }
+      // The default branch's tip can ALSO be an open pull request's head --
+      // a promote-to-release PR opened straight from it, or one simply
+      // caught up to it -- and a status is per-commit, so a verdict this run
+      // publishes for "no pull request" would just as well satisfy that
+      // PR's required check, without its diff ever being classified or
+      // bound. Refused here, and re-checked again in `gate` immediately
+      // before publishing, for the same reason `stillPinned` repeats every
+      // other binding check there rather than trusting this one read.
+      await stillUnclaimed(sha, ctx);
+      return null;
     }
     throw new PolicyError(
       `A dispatched run must name the pull request it reports for — refusing without one.`,
@@ -1131,13 +1161,20 @@ export async function gate(env, policy, ctx, pin = null) {
         `classify's 'base_sha' output to the gate's 'base-sha' input.`,
     );
   }
+  // A PR-less dispatch has no pin to settle -- `pin` is null by construction
+  // for that path -- but it still rests on one claim that can go stale
+  // exactly like a pin can: that its commit heads no open pull request.
+  // Re-verified here, immediately before publishing, for the same reason as
+  // every other settle-before-report check in this file.
+  const prLessDispatch = env.event === "workflow_dispatch" && !env.pr && !pin;
   if (allSuccess) {
     // The heavy jobs vouch for this run's merge snapshot, and the binding
     // proved that snapshot was still the pull request's -- but across several
     // separate reads. Settle before reporting, exactly as the skip path does:
     // a green verdict for a snapshot the pull request no longer shows is the
     // same failure as an unjustified skip, arrived at from the other side.
-    await stillPinned(env.pr, pin, policy, ctx);
+    if (prLessDispatch) await stillUnclaimed(env.sha, ctx);
+    else await stillPinned(env.pr, pin, policy, ctx);
     return;
   }
   if (!allSkipped) {
@@ -1154,7 +1191,8 @@ export async function gate(env, policy, ctx, pin = null) {
   }
   await lintPrefixes(env.pr, policy, ctx, pin);
   // After every read the verdict rests on, not before them.
-  await stillPinned(env.pr, pin, policy, ctx);
+  if (prLessDispatch) await stillUnclaimed(env.sha, ctx);
+  else await stillPinned(env.pr, pin, policy, ctx);
 }
 
 // --- The run --------------------------------------------------------------
