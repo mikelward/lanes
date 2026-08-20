@@ -104,7 +104,7 @@ export function readPolicy(root = ".", readFile = readFileSync, lstat = lstatSyn
 export function parsePolicy(text) {
   const rules = [];
   let prefixes = [];
-  let dispatchWithoutPr = "refuse";
+  let dispatchWithoutPr = { mode: "refuse" };
   let lintTitle = "yes";
 
   text.split("\n").forEach((raw, index) => {
@@ -139,14 +139,49 @@ export function parsePolicy(text) {
         }
         lintTitle = argument;
         break;
-      case "dispatch-without-pr":
-        if (argument !== "refuse" && argument !== "allow") {
+      case "dispatch-without-pr": {
+        // `allow` is unscoped: any ref a dispatch can name satisfies it, which
+        // is exactly the shape of Problem 1 this repository's own TODO.md
+        // describes -- a dispatch against a PR's own branch, naming no PR,
+        // runs that branch's own (possibly rewritten) copy of the workflow,
+        // and the resulting ambient check-run lands on the PR's own head.
+        // `allow-on <branch>` is the scoped alternative: a maintainer's
+        // PR-less dispatch (a release-force button, say) restricted to one
+        // trusted branch, matching what a hand-rolled predecessor of this
+        // engine already enforced in more than one consumer before it moved
+        // here. `allow` still parses, for a consumer that already relies on
+        // it, but `allow-on` is what a new policy should reach for.
+        const [mode, ...modeArgs] = rest;
+        if (mode === "refuse") {
+          if (modeArgs.length > 0) {
+            throw new PolicyError(
+              `${POLICY_PATH}:${lineno}: 'dispatch-without-pr refuse' takes no further argument.`,
+            );
+          }
+          dispatchWithoutPr = { mode: "refuse" };
+        } else if (mode === "allow") {
+          if (modeArgs.length > 0) {
+            throw new PolicyError(
+              `${POLICY_PATH}:${lineno}: 'dispatch-without-pr allow' takes no further argument -- ` +
+                `did you mean 'allow-on <branch>', which restricts it to one ref?`,
+            );
+          }
+          dispatchWithoutPr = { mode: "allow" };
+        } else if (mode === "allow-on") {
+          if (modeArgs.length !== 1 || !modeArgs[0]) {
+            throw new PolicyError(
+              `${POLICY_PATH}:${lineno}: 'dispatch-without-pr allow-on' needs exactly one branch name.`,
+            );
+          }
+          dispatchWithoutPr = { mode: "allow-on", ref: modeArgs[0] };
+        } else {
           throw new PolicyError(
-            `${POLICY_PATH}:${lineno}: 'dispatch-without-pr' takes refuse or allow, not '${argument}'.`,
+            `${POLICY_PATH}:${lineno}: 'dispatch-without-pr' takes refuse, allow, or allow-on <branch>, ` +
+              `not '${argument}'.`,
           );
         }
-        dispatchWithoutPr = argument;
         break;
+      }
       default:
         // Refused rather than skipped. A typo'd directive silently ignored is
         // a policy that quietly does less than it says -- and for a `code`
@@ -577,10 +612,19 @@ export async function stillPinned(pr, pin, policy, ctx) {
  * input supplies the number independently, so nothing else stops a dispatch
  * on code PR A's branch from landing docs PR B's verdict on A's head.
  */
-export async function verifyDispatchBinding({ event, pr, sha, dispatchWithoutPr, baseSha }, ctx) {
+export async function verifyDispatchBinding({ event, pr, sha, ref, dispatchWithoutPr, baseSha }, ctx) {
   if (event !== "workflow_dispatch") return null;
   if (!pr) {
-    if (dispatchWithoutPr === "allow") return null;
+    if (dispatchWithoutPr.mode === "allow") return null;
+    if (dispatchWithoutPr.mode === "allow-on") {
+      const expected = `refs/heads/${dispatchWithoutPr.ref}`;
+      if (ref === expected) return null;
+      throw new PolicyError(
+        `A dispatched run with no pull request is only allowed on '${expected}', but this run's ref is ` +
+          `'${ref || "<unset>"}' — a dispatch against any other ref could be running that branch's own, ` +
+          `possibly-tampered copy of this workflow.`,
+      );
+    }
     throw new PolicyError(
       `A dispatched run must name the pull request it reports for — refusing without one.`,
     );

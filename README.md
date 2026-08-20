@@ -59,7 +59,12 @@ docs docs/*.md
 # must carry one, so nothing riding it reads like a behavior change.
 prefixes design docs todo test build refactor
 
-# Optional; defaults to refuse.
+# Optional; defaults to refuse. `allow` accepts a PR-less dispatch against
+# ANY ref -- including a pull request's own branch, running that branch's own
+# copy of this workflow -- so prefer `allow-on <branch>` (e.g. `allow-on
+# main`) for the one legitimate case, a maintainer's release-force dispatch
+# with no pull request to name, restricted to the one ref that's actually
+# trusted.
 dispatch-without-pr refuse
 
 # Optional; defaults to YES. Whether the PULL REQUEST TITLE must carry a prefix

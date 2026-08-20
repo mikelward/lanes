@@ -225,10 +225,32 @@ describe("policy parsing", () => {
     assert.throws(() => parsePolicy("docs *.md\n"), /sets no prefixes/);
   });
 
-  test("dispatch-without-pr takes only refuse or allow", () => {
-    assert.equal(parsePolicy("docs *.md\nprefixes docs\n").dispatchWithoutPr, "refuse");
-    assert.equal(parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow\n").dispatchWithoutPr, "allow");
-    assert.throws(() => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr maybe\n"), /takes refuse or allow/);
+  test("dispatch-without-pr takes refuse, allow, or allow-on <branch>", () => {
+    assert.deepEqual(parsePolicy("docs *.md\nprefixes docs\n").dispatchWithoutPr, { mode: "refuse" });
+    assert.deepEqual(
+      parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow\n").dispatchWithoutPr,
+      { mode: "allow" },
+    );
+    assert.deepEqual(
+      parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow-on main\n").dispatchWithoutPr,
+      { mode: "allow-on", ref: "main" },
+    );
+    assert.throws(
+      () => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr maybe\n"),
+      /takes refuse, allow, or allow-on/,
+    );
+    assert.throws(
+      () => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow-on\n"),
+      /needs exactly one branch name/,
+    );
+    assert.throws(
+      () => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow-on main topic\n"),
+      /needs exactly one branch name/,
+    );
+    assert.throws(
+      () => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr allow extra\n"),
+      /takes no further argument/,
+    );
   });
 });
 
@@ -359,9 +381,36 @@ describe("binding a run to its own pull request", () => {
   });
 
   test("a dispatch must name a pull request unless the policy allows none", async () => {
-    const env = { event: "workflow_dispatch", pr: "", dispatchWithoutPr: "refuse" };
+    const env = { event: "workflow_dispatch", pr: "", dispatchWithoutPr: { mode: "refuse" } };
     await assert.rejects(verifyDispatchBinding(env, ctx({})), /must name the pull request/);
-    await assert.doesNotReject(verifyDispatchBinding({ ...env, dispatchWithoutPr: "allow" }, ctx({})));
+    await assert.doesNotReject(
+      verifyDispatchBinding({ ...env, dispatchWithoutPr: { mode: "allow" } }, ctx({})),
+    );
+  });
+
+  test("allow-on restricts a PR-less dispatch to one ref, unlike bare allow", async () => {
+    // The gap this closes: `allow` accepts a PR-less dispatch against ANY
+    // ref, including a pull request's own branch -- which runs that
+    // branch's own, possibly-tampered copy of this workflow, and the
+    // resulting ambient check-run lands on the PR's own head. `allow-on`
+    // is how a maintainer's release-force dispatch (no PR, always against
+    // the default branch) stays possible without reopening that.
+    const env = {
+      event: "workflow_dispatch",
+      pr: "",
+      dispatchWithoutPr: { mode: "allow-on", ref: "main" },
+    };
+    await assert.doesNotReject(
+      verifyDispatchBinding({ ...env, ref: "refs/heads/main" }, ctx({})),
+    );
+    await assert.rejects(
+      verifyDispatchBinding({ ...env, ref: "refs/heads/some-pr-branch" }, ctx({})),
+      /only allowed on 'refs\/heads\/main'/,
+    );
+    await assert.rejects(
+      verifyDispatchBinding({ ...env, ref: undefined }, ctx({})),
+      /this run's ref is '<unset>'/,
+    );
   });
 
   test("a dispatch for another pull request's commit is refused", async () => {
@@ -613,7 +662,7 @@ describe("a classification that cannot be established", () => {
     // Its lookups are two more API calls that a blip can fail, and they run
     // before the classification. Outside the wrapper they failed the classify
     // job, which fails the gate, for a run that should have taken full lane.
-    const dispatch = { event: "workflow_dispatch", pr: "1", sha: "headsha", dispatchWithoutPr: "refuse" };
+    const dispatch = { event: "workflow_dispatch", pr: "1", sha: "headsha", dispatchWithoutPr: { mode: "refuse" } };
     await assert.rejects(verifyDispatchBinding(dispatch, broken), /network down/, "the check really does throw");
     assert.equal(await classifyOrCode(() => verifyDispatchBinding(dispatch, broken), () => {}), false);
   });
