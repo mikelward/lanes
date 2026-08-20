@@ -26,6 +26,7 @@
 import { readFileSync, lstatSync, readdirSync } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { matchesGlob } from "node:path";
+import { createSign } from "node:crypto";
 
 // Fixed, not configurable. Every route into the old configurable path -- a
 // symlinked file, a symlinked directory component, a multi-hop chain, a `..`
@@ -615,6 +616,227 @@ export async function verifyDispatchBinding({ event, pr, sha, dispatchWithoutPr,
   return { head: sha, baseRef: meta.base.ref, baseSha: baseSha || null, title: null };
 }
 
+// --- Publishing --------------------------------------------------------
+//
+// Every mode above answers whether a diff may skip; none of it writes
+// anything. A consumer that trusts the ambient Actions check-run to report
+// `gate`'s own pass/fail is trusting a mechanism the job DEFINITION
+// controls -- and under `pull_request`, that definition is the pull
+// request's own copy. What follows is the alternative: authenticate as a
+// dedicated GitHub App -- never the ambient `GITHUB_TOKEN`, which any
+// workflow in the repository can mint -- and post the commit status
+// directly, by API call, onto the exact commit the event named. A same-repo
+// pull request adding its own `push`-triggered workflow can call the same
+// API with the ambient token, but cannot produce the App's identity without
+// its private key, which is why the CREDENTIAL closes the hole, not the
+// mechanism.
+//
+// Used only when a consumer supplies `app-id`/`app-private-key` (`init`
+// mode always requires them; `gate` mode treats them as opt-in). Every
+// existing consumer that supplies neither is completely unaffected -- `gate`
+// still just throws or returns, exactly as it always has.
+//
+// The JWT-then-installation-token exchange below (sign a short-lived App JWT,
+// look up this repo's installation, mint a token from it) is GitHub's own
+// long-stable App-authentication flow, not something this repository is
+// inventing -- unlike the `pull_request_target` field semantics elsewhere in
+// this design, which TODO.md flags as unverified against live docs, this
+// mechanism is not in question. What IS still open, and is a consumer
+// workflow's concern rather than this file's, is whether an environment's
+// deployment-branch policy actually restricts a `pull_request_target` run's
+// access to the credential the way the design assumes -- see TODO.md.
+
+function base64url(bufferOrString) {
+  const buf = Buffer.isBuffer(bufferOrString) ? bufferOrString : Buffer.from(bufferOrString);
+  return buf.toString("base64url");
+}
+
+function defaultSign(signingInput, privateKeyPem) {
+  return createSign("RSA-SHA256").update(signingInput).sign(privateKeyPem);
+}
+
+/**
+ * A short-lived JWT identifying the App itself, not an installation.
+ *
+ * `iat` is backdated 60s for clock drift between this runner and GitHub's --
+ * a `iat` GitHub reads as still in the future is rejected outright, and a
+ * runner's clock running fast is not this file's to fix. `exp` is 10
+ * minutes, GitHub's own maximum for an App JWT.
+ */
+export function signAppJwt(appId, privateKeyPem, now = Math.floor(Date.now() / 1000), sign = defaultSign) {
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = { iat: now - 60, exp: now + 600, iss: String(appId) };
+  const signingInput = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(payload))}`;
+  return `${signingInput}.${base64url(sign(signingInput, privateKeyPem))}`;
+}
+
+/** This App's installation on the repo, or a refusal naming why there is none. */
+export async function installationId(repo, appJwt, fetchImpl = fetch) {
+  const res = await fetchImpl(`https://api.github.com/repos/${repo}/installation`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${appJwt}`,
+      "x-github-api-version": "2022-11-28",
+    },
+  });
+  if (!res.ok) {
+    throw new PolicyError(
+      `Could not find this App's installation on ${repo} (${res.status}) -- is it installed there?`,
+    );
+  }
+  return (await res.json()).id;
+}
+
+/**
+ * A fresh installation access token. Minted per run, never stored: an
+ * installation token expires in an hour, so storing one directly would leave
+ * every later run unable to publish once it expired. The App ID and private
+ * key are the credential a consumer holds; this is what they are exchanged
+ * for, each time.
+ */
+export async function installationToken(id, appJwt, fetchImpl = fetch) {
+  const res = await fetchImpl(`https://api.github.com/app/installations/${id}/access_tokens`, {
+    method: "POST",
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${appJwt}`,
+      "x-github-api-version": "2022-11-28",
+    },
+  });
+  if (!res.ok) {
+    throw new PolicyError(
+      `Could not mint an installation token (${res.status}) -- the App credential may be wrong or revoked.`,
+    );
+  }
+  return (await res.json()).token;
+}
+
+/** Authenticate as the App and return a token scoped to this repo's installation. */
+export async function appToken({ appId, privateKey, repo }, fetchImpl = fetch, sign = defaultSign) {
+  if (!appId || !privateKey) {
+    throw new PolicyError(
+      `Publishing a status needs both app-id and app-private-key -- refusing to post unauthenticated.`,
+    );
+  }
+  const jwt = signAppJwt(appId, privateKey, undefined, sign);
+  const id = await installationId(repo, jwt, fetchImpl);
+  return installationToken(id, jwt, fetchImpl);
+}
+
+// The Statuses API's own cap; a longer description is rejected outright
+// rather than truncated server-side.
+const DESCRIPTION_LIMIT = 140;
+
+/**
+ * The commit a status belongs on.
+ *
+ * Never `GITHUB_SHA` for `pull_request`/`pull_request_target` -- under the
+ * latter that env var is the BASE branch's tip, not the pull request's, and
+ * publishing there would report success on a commit nobody proposed while
+ * the pull request's own head sits forever waiting for a status nothing ever
+ * posts against it. The event payload's `pull_request.head.sha` is the one
+ * fact either trigger carries about which commit it actually concerns.
+ */
+export function statusSha({ event, snapshot, sha }) {
+  if (event === "pull_request" || event === "pull_request_target") {
+    if (!snapshot || !snapshot.head) {
+      throw new PolicyError(
+        `No pull request head in the event payload -- refusing to post a status for an unresolved commit.`,
+      );
+    }
+    return snapshot.head;
+  }
+  // workflow_dispatch: GITHUB_SHA is the dispatched ref's own tip, which
+  // verifyDispatchBinding already ties to the named pull request's head
+  // before any verdict is trusted.
+  return sha;
+}
+
+function runUrl(env) {
+  if (!env.GITHUB_SERVER_URL || !env.GITHUB_REPOSITORY || !env.GITHUB_RUN_ID) return undefined;
+  return `${env.GITHUB_SERVER_URL}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}`;
+}
+
+/** Post the `lanes` commit status directly, authenticated as the App. */
+export async function publishStatus({ repo, sha, state, description, targetUrl }, token, fetchImpl = fetch) {
+  const res = await fetchImpl(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
+    method: "POST",
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${token}`,
+      "x-github-api-version": "2022-11-28",
+    },
+    body: JSON.stringify({
+      state,
+      context: "lanes",
+      description: description ? description.slice(0, DESCRIPTION_LIMIT) : undefined,
+      target_url: targetUrl,
+    }),
+  });
+  if (!res.ok) {
+    throw new PolicyError(`Could not post the lanes status (${res.status}) onto ${sha}.`);
+  }
+}
+
+/**
+ * `init` mode's entire job: resolve the commit and post `pending`.
+ *
+ * No binding verification, no checkout, no policy read -- `pending` is never
+ * a passing state, so posting it on the wrong commit costs nothing a
+ * `gate`-mode failure or a fresh run does not already fix, and the whole
+ * point of this job is to run before anything else has had a chance to.
+ */
+export async function publishPending(env, appCreds, fetchImpl = fetch, sign = defaultSign) {
+  const repo = env.GITHUB_REPOSITORY;
+  const sha = statusSha({ event: env.GITHUB_EVENT_NAME, snapshot: eventSnapshot(env), sha: env.GITHUB_SHA });
+  const token = await appToken({ ...appCreds, repo }, fetchImpl, sign);
+  await publishStatus(
+    { repo, sha, state: "pending", description: "Waiting on the required jobs.", targetUrl: runUrl(env) },
+    token,
+    fetchImpl,
+  );
+}
+
+/**
+ * `gate` mode's optional second half: publish the terminal status once
+ * `gate()` has already thrown or returned.
+ *
+ * Takes the error `gate()` threw, or null, and re-throws afterward so the
+ * job itself still reports red -- the explicit status is IN ADDITION to
+ * that, never instead of it, so a consumer can watch the job's own log
+ * exactly as before. A failure publishing the status is never swallowed
+ * either: it is at least as urgent as `gate`'s own verdict, since it means
+ * the required check may not have received a terminal value at all.
+ */
+export async function publishResult(env, gateErr, appCreds, fetchImpl = fetch, sign = defaultSign) {
+  const repo = env.GITHUB_REPOSITORY;
+  const sha = statusSha({ event: env.GITHUB_EVENT_NAME, snapshot: eventSnapshot(env), sha: env.GITHUB_SHA });
+  let publishErr = null;
+  try {
+    const token = await appToken({ ...appCreds, repo }, fetchImpl, sign);
+    await publishStatus(
+      {
+        repo,
+        sha,
+        state: gateErr ? "failure" : "success",
+        description: gateErr ? gateErr.message : "Every required job passed.",
+        targetUrl: runUrl(env),
+      },
+      token,
+      fetchImpl,
+    );
+  } catch (e) {
+    publishErr = e;
+  }
+  if (gateErr && publishErr) {
+    throw new PolicyError(
+      `${gateErr.message} (additionally, could not publish the status: ${publishErr.message})`,
+    );
+  }
+  if (publishErr) throw publishErr;
+  if (gateErr) throw gateErr;
+}
+
 // --- Modes -----------------------------------------------------------------
 
 /** true when every changed path is documentation and the verdict is trustworthy. */
@@ -880,10 +1102,18 @@ export async function main(env = process.env) {
   const mode = input("mode");
   // Before anything else, so an unknown mode is an error rather than a
   // classify-shaped fallback that reports code and exits 0.
-  if (mode !== "classify" && mode !== "gate") {
-    throw new PolicyError(`Unknown mode '${mode}' — expected 'classify' or 'gate'.`);
+  if (mode !== "classify" && mode !== "gate" && mode !== "init") {
+    throw new PolicyError(`Unknown mode '${mode}' — expected 'classify', 'gate', or 'init'.`);
   }
   const ctx = { token: input("token"), repo: env.GITHUB_REPOSITORY };
+  const appCreds = { appId: input("app-id"), privateKey: input("app-private-key") };
+
+  // The initializer: no policy, no checkout, no binding -- just post
+  // `pending` before anything else in the graph has a chance to run.
+  if (mode === "init") {
+    await publishPending(env, appCreds);
+    return;
+  }
 
   let baseSha = "";
   // One body for both modes, so neither can grow a check the other lacks.
@@ -920,7 +1150,20 @@ export async function main(env = process.env) {
 
   // The gate fails on all of it; classify fails on none of it.
   if (mode === "gate") {
-    await work();
+    let err = null;
+    try {
+      await work();
+    } catch (e) {
+      err = e;
+    }
+    // Opt-in: a consumer that supplies neither credential gets exactly the
+    // behavior this had before either existed -- throw or return, and let
+    // the ambient Actions check-run report it, same as today.
+    if (appCreds.appId || appCreds.privateKey) {
+      await publishResult(env, err, appCreds);
+      return;
+    }
+    if (err) throw err;
     return;
   }
   const docsOnly = await classifyOrCode(work);

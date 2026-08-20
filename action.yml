@@ -7,7 +7,8 @@ inputs:
   mode:
     description: >-
       'classify' to decide whether the heavy jobs may skip (sets the docs_only
-      output), or 'gate' to render the verdict the ruleset requires. The gate
+      output), 'gate' to render the verdict the ruleset requires, or 'init' to
+      post a `pending` status before anything else in the graph runs. The gate
       re-derives the classification itself rather than trusting the output, so
       a classification bug is a red check rather than a silent merge.
     required: true
@@ -50,6 +51,27 @@ inputs:
       workflow's own.
     required: false
     default: ${{ github.token }}
+  app-id:
+    description: >-
+      init mode always, gate mode optionally. The ID of a dedicated GitHub
+      App whose identity a ruleset can restrict the required check to. `gate`
+      mode still works exactly as before -- throw or return, no status posted
+      -- when this and app-private-key are both empty; supply both to also
+      publish the terminal status directly, authenticated as the App, rather
+      than relying on the ambient Actions check-run. Never the ambient
+      `github.token`: any workflow in the repository can mint that, which is
+      the exact hole a dedicated App identity exists to close. Store both
+      this and app-private-key in a GitHub Environment restricted to the
+      trusted base ref, not a bare repository or organization secret -- see
+      the README.
+    required: false
+    default: ''
+  app-private-key:
+    description: >-
+      init mode always, gate mode optionally. The App's PEM private key. See
+      app-id.
+    required: false
+    default: ''
 
 outputs:
   docs_only:
