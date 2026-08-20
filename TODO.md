@@ -337,6 +337,36 @@
       this round depended on it, since the publishing layer reasons entirely
       from the event payload and the API, never from `GITHUB_REF`.
 
+      **Round nine sharpened what "the mechanism exists" does not cover: a
+      publisher that CANNOT post at all leaves a stale verdict standing
+      un-revalidated, and requiring only the App-posted `lanes` status never
+      sees it.** Neither `init` nor `gate` swallows an authentication or
+      publish failure -- both re-throw, so the job that hit it fails its own
+      Actions check-run -- but that check-run was never in the required-check
+      list README.md instructed, only the `lanes` status context was. A run
+      whose App credential has gone bad (revoked, expired, the App
+      uninstalled) cannot post `pending` OR a fresh terminal state, so
+      whatever `lanes: success` a previous, healthy run already posted on
+      that commit simply stands, and a ruleset requiring `lanes` alone
+      accepts it -- even across a retarget or title edit that should have
+      started a fresh, unvalidated verdict. The README's example now
+      instructs requiring `init` and the finalizer job (renamed `finalize`,
+      away from `lanes`, specifically so its own check-run is never confused
+      with the App-posted status of the same name) ALONGSIDE the App-posted
+      `lanes` status -- both job definitions load from the base branch under
+      `pull_request_target` exactly like `lanes` itself, so requiring them
+      costs nothing a same-repo pull request could forge, and turns "the
+      publisher silently couldn't refresh anything" into a required check
+      that is directly red rather than an absence of change. Two things this
+      does NOT close, both left open rather than asserted past what is
+      known: whether a ruleset actually disambiguates two same-named checks
+      from different sources cleanly is exactly why the finalizer was
+      renamed rather than relied on to coexist with `lanes` under one name;
+      and the underlying "first-write latency" window this design has
+      flagged since round three -- the gap between a new event firing and
+      its own fresh status actually landing -- still is not, and cannot be,
+      closed to zero by anything here.
+
       **Alternatives considered and why they are not the design:**
       - GitHub rulesets have a "require workflows to pass" rule type that
         may pin a required workflow's source independently of the PR
