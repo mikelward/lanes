@@ -437,6 +437,60 @@
       unverified (exact `pull_request_target` field values, Statuses-API
       ordering guarantees) get answered by a live run instead of a guess.
 
+      **Round eighteen: this whole sub-thread (rounds ten through
+      seventeen) is condensed here rather than kept as a full transcript
+      — this design is not planned work, and it does not need to be
+      over-specified in the meantime (repository owner, this PR).** The
+      short version: `check_consumer.py`'s `lanes_publisher_only`
+      (mikelward/codex-review#27) leaves one prerequisite it cannot verify
+      from a workflow file alone — a self-hosted runner registered under
+      an exact GitHub-hosted label like `ubuntu-latest` is indistinguishable,
+      on paper, from GitHub's own machine of the same name. A service
+      genuinely outside GitHub Actions — one the candidate runner cannot
+      execute code on or see the process of — can close this: it verifies
+      a job's GitHub-minted OIDC token (signature, audience,
+      `runner_environment`, and the token's repository/workflow/run
+      binding), independently derives the actual target commit from
+      trusted metadata rather than a runner-supplied parameter (the
+      token's own `sha`/`ref` name the base or dispatch ref, never the PR
+      head, under `pull_request_target`), and publishes the result
+      itself — it never hands back any status-writing credential, since a
+      GitHub App installation token is scoped by repository and
+      permission type, not to one commit or context, so returning one
+      would let a colliding runner forge statuses elsewhere until it
+      expires. A self-hosted runner gets nothing to forge with even if it
+      is the exact machine a job landed on. Extending that same verification to every
+      job whose result feeds the verdict, not only the publisher, needs
+      each job bound to its own identity — today's OIDC claims describe
+      the *run*, not the job within it, so naively reusing them doesn't
+      give that for free when several jobs share one workflow file; real
+      job-level binding would need each contributing job restructured as
+      its own reusable-workflow call. None of that is worked out further
+      than this paragraph, on purpose: building it means standing up and
+      operating this fleet's first infrastructure outside GitHub Actions,
+      against every sibling repository's "no dependencies" design, and
+      that is a real trade-off for the owner to decide if and when it
+      becomes worth doing — not something to design in more detail while
+      it stays hypothetical.
+
+      **One correction to the risk framing, worth keeping accurate:** the
+      account-level access this gap has been described as needing is
+      required to *create* a colliding runner label (an admin registering
+      or misconfiguring one — a mistake, not necessarily an attack), not to
+      *exploit* one that already exists. A self-hosted runner is ordinarily
+      persistent, and this design already runs ordinary pull-request code
+      deliberately on `runs-on: ubuntu-latest` (the `test` job); an
+      unprivileged PR landing on an already-colliding runner could plant
+      something that survives to compromise a later, privileged job on the
+      same machine — the standard untrusted-PR threat model this whole
+      design exists to defend against, not a scenario requiring the
+      attacker to already hold elevated access themselves. Nothing here
+      says such a runner exists today (the checker's whole premise is that
+      the fleet has none); it says the gap is one ordinary pull request
+      away from the precondition, not two account-access steps away, if
+      the precondition is ever true. Still not blocking the rollout
+      already in flight, still the owner's call whether to close it.
+
 ## Review and merge gates
 
 - [ ] Verify the settings half of the fleet's bar — every repository works
