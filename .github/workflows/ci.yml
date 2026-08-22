@@ -57,15 +57,16 @@ jobs:
           mode: classify
           pr: ${{ github.event.pull_request.number }}
 
-  # Deliberately unconditional for now: the main ruleset still requires
-  # `test`, and GitHub counts a skipped required check as satisfied -- so
-  # enabling the docs-only skip before the ruleset requires `lanes` instead
-  # would let a docs-only PR merge on a skip nothing re-verified. The skip
-  # (`needs: classify` plus the docs_only condition) lands in a follow-up
-  # once the ruleset flip in TODO.md has happened.
+  # Skipped on a docs-only diff -- safe now that the main ruleset requires
+  # `lanes`, not `test`, directly: a skipped `test` here no longer
+  # satisfies anything by itself, because `lanes` below re-derives the
+  # classification independently (`mode: gate`) rather than trusting
+  # classify's output, and is the job actually required to merge.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
     steps:
       - uses: actions/checkout@v5
         with:
@@ -98,14 +99,13 @@ jobs:
       - name: Test
         run: node --test lanes.test.mjs workflows.test.mjs
 
-  # The one check the main ruleset should require alongside `codex` and
+  # The one check the main ruleset requires, alongside `codex` and
   # `zizmor` (which runs unfiltered on every PR exactly so it can be
   # required -- see its header). Always runs, always reports -- green only
-  # when the test job
-  # succeeded, or when it was skipped and the skip is INDEPENDENTLY verified
-  # as justified: the gate re-derives the classification itself rather than
-  # trusting classify's output. Any other combination is an explicit red,
-  # never a silent pass.
+  # when the test job succeeded, or when it was skipped and the skip is
+  # INDEPENDENTLY verified as justified: the gate re-derives the
+  # classification itself rather than trusting classify's output. Any
+  # other combination is an explicit red, never a silent pass.
   lanes:
     name: lanes
     runs-on: ubuntu-latest
