@@ -12,7 +12,8 @@ merge here reaches every consumer's required check on their next pull
 request, with no release step in between.** Everything below follows from that.
 
 Decisions that are not visible from the code — including why this repository
-deliberately does **not** run its own lane on itself — are in `SPEC.md`.
+runs its own lane on itself with the lane jobs' engine at `@main`, and
+`uses: ./` only where nothing gates on it — are in `SPEC.md`.
 
 Keep this file as short as it can be and still work. Every session loads it
 whole, so each rule costs context on every turn: add one the first time

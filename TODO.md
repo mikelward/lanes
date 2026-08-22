@@ -446,3 +446,23 @@
       not verify, is the settings half: a ruleset on the default branch
       requiring the CI gate, the `codex` status, conversation resolution
       and up-to-date branches, and the auto-merge setting enabled.
+
+- [ ] **Flip the main ruleset to require `lanes codex zizmor`** — the
+      fleet standard, replacing any rule naming `test` directly — now that
+      `lanes` reports on every pull request and zizmor.yml runs unfiltered
+      (its `paths:` filter is gone precisely so it can be required: a
+      paths-filtered workflow creates no check run at all on a
+      non-matching PR, which would leave the ruleset waiting forever —
+      this repo pilots that change; the sibling repos' zizmor workflows
+      follow once this has proven out). The docs-only skip is
+      deliberately NOT enabled yet: ci.yml's test job runs
+      unconditionally, because while the ruleset still requires `test`, a
+      skipped `test` would count as satisfied with nothing re-verifying
+      the skip. Sequence: (1) this branch merges with `lanes` and
+      `zizmor` reporting on every PR and `test` unconditional; (2) the
+      ruleset flips — `repo-rules mikelward/lanes` with no arguments
+      applies the standard set, a step outside what a session without
+      ruleset API access can do; (3) a follow-up PR gives the test job
+      `needs: classify` and
+      `if: needs.classify.outputs.docs_only != 'true'`, and flips the
+      workflows.test.mjs pin that holds it unconditional.
