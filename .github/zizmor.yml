@@ -20,6 +20,11 @@ rules:
         # codex-review-check.yml each need their own entry.
         "mikelward/codex-review": ref-pin
         "mikelward/codex-review/.github/workflows/check-consumer.yml": ref-pin
+        # This repository's own action, which ci.yml runs on itself at
+        # `@main` deliberately -- the merged engine judging the branch is
+        # the security property, so a pin here would defeat the point as
+        # well as add a bump-on-every-merge chore. See SPEC.md.
+        "mikelward/lanes": ref-pin
         # Official actions may pin to a tag, as every workflow here does.
         # Hash-pinning them instead is a deliberate open question, tracked
         # the same way mikelward/codex-review tracks it for itself.

@@ -6,20 +6,63 @@ name: CI
 # and every consumer's required check: there is no release step afterwards to
 # catch anything. The `push` run below re-checks the commit the merge produced.
 #
-# This repository deliberately does NOT ride its own lane. The lane exists to
-# skip heavy jobs, and there are none here -- the suite is a fraction of a
-# second -- so classify plus gate would add two jobs and a required check to
-# save nothing. A consumer with a real build is where it pays.
+# This repository rides its own lane -- a decision reversed once, in both
+# directions deliberately; SPEC.md records why. The short form: the suite is
+# unit-level against a stubbed API, so classify and lanes below are the only
+# place the engine executes AS AN ACTION -- manifest, runtime, entry point,
+# on a live pull request -- before a merge reaches every consumer. Both jobs
+# run `mikelward/lanes@main`, never this branch's own copy: a branch judged
+# by its own engine could rewrite the engine to bless itself.
 on:
   push:
     branches: [main]
   pull_request:
+    # `edited` is here because a retarget changes what the PR's diff is
+    # measured against while the head -- and any `lanes` check run already
+    # minted on it -- stays put, so a base change must start a fresh run.
+    # Title and body edits re-run the lane too, deliberately: a skipped
+    # job would be worse, because GitHub counts a skipped required check
+    # as satisfied, so skipping the gate on a "harmless" edit would let a
+    # newer skipped run replace a red verdict on the same head.
+    types: [opened, synchronize, reopened, edited]
 
-# Nothing here writes to the repository.
+# Nothing here writes to the repository. The classify and lanes jobs read
+# the PR's files and commits through the workflow token; read-only, and
+# still nothing here can write.
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
+  # Classifies the diff: docs_only is true only when every changed file in
+  # the PR is housekeeping (markdown -- see .github/lanes.conf for the
+  # rule). Pushes to main are always classified as code. Nothing consumes
+  # docs_only yet -- see the test job for why the skip is staged.
+  classify:
+    name: Classify the diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.lane.outputs.docs_only }}
+      base_sha: ${{ steps.lane.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # `@main`, not `./` -- see the header: the merged engine judges the
+      # branch, never the branch's own copy of it.
+      - uses: mikelward/lanes@main
+        id: lane
+        with:
+          mode: classify
+          pr: ${{ github.event.pull_request.number }}
+
+  # Deliberately unconditional for now: the main ruleset still requires
+  # `test`, and GitHub counts a skipped required check as satisfied -- so
+  # enabling the docs-only skip before the ruleset requires `lanes` instead
+  # would let a docs-only PR merge on a skip nothing re-verified. The skip
+  # (`needs: classify` plus the docs_only condition) lands in a follow-up
+  # once the ruleset flip in TODO.md has happened.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -27,6 +70,20 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
+
+      # The branch's own manifest, loaded and executed by Actions itself --
+      # the one gap the unit suite and the @main lane jobs both leave open:
+      # a change to action.yml's wiring (runs.using, the entry point, input
+      # names) would otherwise first execute on consumers, after merging.
+      # classify is the cheapest full pass through the manifest, and nothing
+      # gates on this step's output -- only its exit status, which feeds
+      # this job's result, which the @main gate assesses. So `uses: ./` is
+      # safe here, and only here: the branch still cannot bless itself.
+      - name: Run the branch's own action end to end
+        uses: ./
+        with:
+          mode: classify
+          pr: ${{ github.event.pull_request.number }}
 
       # The major the action manifest declares. `path.matchesGlob` is what
       # this engine leans on rather than hand-rolling a matcher, so the
@@ -40,3 +97,32 @@ jobs:
       # silent gap, and naming it here is the one place that shows up.
       - name: Test
         run: node --test lanes.test.mjs workflows.test.mjs
+
+  # The one check the main ruleset should require alongside `codex` and
+  # `zizmor` (which runs unfiltered on every PR exactly so it can be
+  # required -- see its header). Always runs, always reports -- green only
+  # when the test job
+  # succeeded, or when it was skipped and the skip is INDEPENDENTLY verified
+  # as justified: the gate re-derives the classification itself rather than
+  # trusting classify's output. Any other combination is an explicit red,
+  # never a silent pass.
+  lanes:
+    name: lanes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [classify, test]
+    if: always()
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: mikelward/lanes@main
+        with:
+          mode: gate
+          pr: ${{ github.event.pull_request.number }}
+          classify-result: ${{ needs.classify.result }}
+          # Only read on a dispatched run, and harmless on a pull_request
+          # one, which takes the same commit from its own event payload.
+          base-sha: ${{ needs.classify.outputs.base_sha }}
+          results: >-
+            test=${{ needs.test.result }}

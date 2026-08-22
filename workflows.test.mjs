@@ -16,6 +16,8 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { readPolicy, parsePolicy, isDocs, hasPrefix, POLICY_PATH } from "./lanes.mjs";
+
 const dir = fileURLToPath(new URL("./.github/workflows/", import.meta.url));
 const read = (name) => readFileSync(`${dir}${name}`, "utf8");
 
@@ -94,6 +96,97 @@ describe("the codex-review workflow", () => {
       if (name === "codex-review.yml") assert.match(text, /statuses: write/);
       else assert.doesNotMatch(text, /statuses:\s*write/, `${name} must not hold statuses: write`);
     }
+  });
+});
+
+describe("this repository's own lane", () => {
+  // ci.yml rides the engine on itself -- SPEC.md records why, and these pins
+  // hold the two properties the reasoning stands on: the engine judging a
+  // branch is the MERGED one, and the skippable job can only be skipped on
+  // the classify verdict the gate independently re-derives.
+  const workflow = read("ci.yml");
+
+  // A job's content sits at 4+ spaces of indent; capture stops at the next
+  // line shallower than that, so a following job key or a 2-space comment
+  // between jobs ends the block.
+  const jobBlock = (name) => {
+    const m = workflow.match(new RegExp(`\\n {2}${name}:\\n((?: {4,}.*\\n| *\\n)*)`));
+    return m ? m[1] : "";
+  };
+
+  test("classify and the gate run the merged engine; only test runs the branch's copy", () => {
+    // In the lane jobs, `uses: ./` would let a pull request rewrite the
+    // engine and be judged by its own rewrite -- the self-blessing hole
+    // SPEC.md names. `@main` is deliberate for the same reason it is in
+    // every consumer: there is no release step, so main IS the release.
+    // Inside the test job the branch's own copy is the point -- the
+    // integration step loads the branch's manifest, and nothing gates on
+    // its output; its exit status feeds the test job's result, which the
+    // @main gate assesses.
+    const jobs = { classify: jobBlock("classify"), test: jobBlock("test"), lanes: jobBlock("lanes") };
+    for (const [name, block] of Object.entries(jobs)) {
+      assert.ok(block.length > 0, `the ${name} job block was found`);
+    }
+    for (const name of ["classify", "lanes"]) {
+      assert.match(jobs[name], /uses: mikelward\/lanes@main/, `${name} runs the merged engine`);
+      assert.doesNotMatch(jobs[name], /uses: \.\//, `${name} must not run the branch's own copy`);
+    }
+    assert.match(jobs.test, /uses: \.\//, "the test job exercises the branch's own manifest");
+    assert.doesNotMatch(jobs.test, /uses: mikelward\/lanes@main/);
+  });
+
+  test("the required check is the always-reporting gate, named lanes", () => {
+    // `if: always()` is what makes `lanes` safe to require: without it the
+    // gate is skipped whenever classify or test is, and GitHub counts a
+    // skipped required check as satisfied.
+    assert.match(workflow, /\n {2}lanes:\n {4}name: lanes\n/);
+    assert.match(workflow, /\n {4}needs: \[classify, test\]\n {4}if: always\(\)\n/);
+    assert.match(workflow, /mode: gate/);
+    assert.match(workflow, /results: >-\n {12}test=\$\{\{ needs\.test\.result \}\}/);
+  });
+
+  test("the suite runs unconditionally until the ruleset requires lanes", () => {
+    // Deliberately staged: while the ruleset still requires `test`, a
+    // skipped `test` counts as satisfied with nothing re-verifying the
+    // skip -- so the docs-only skip lands only after the flip to requiring
+    // `lanes`. TODO.md holds the sequence; this pin flips with it, to
+    // `if: needs.classify.outputs.docs_only != 'true'` on the test job.
+    assert.match(workflow, /mode: classify/);
+    assert.doesNotMatch(workflow, /needs\.classify\.outputs\.docs_only/);
+  });
+
+  test("the actual policy classifies both directions under the real engine", () => {
+    // lanes.test.mjs exercises the engine against inline fixture policies;
+    // this is the one place the repository's own .github/lanes.conf meets
+    // the real parser and matcher, so a mistaken glob or prefix there
+    // cannot ride a green suite. Parse first, and prove it found
+    // something -- an empty rule list would classify everything as code
+    // and leave the docs-direction assertions below vacuously wrong.
+    const policy = parsePolicy(readPolicy(fileURLToPath(new URL("./", import.meta.url))));
+    assert.ok(policy.rules.length > 0, "the policy parse found rules");
+    assert.ok(policy.prefixes.length > 0, "the policy parse found prefixes");
+    for (const path of ["README.md", "SPEC.md", "AGENTS.md", "TODO.md", "docs/notes.md"]) {
+      assert.equal(isDocs(path, policy.rules), true, `${path} rides the docs lane`);
+    }
+    // The code direction includes the engine, the manifest, the workflows,
+    // a non-markdown prose file, and the policy file itself, which the
+    // engine hard-codes as code whatever the policy says.
+    for (const path of ["lanes.mjs", "action.yml", ".github/workflows/ci.yml", "LICENSE", POLICY_PATH]) {
+      assert.equal(isDocs(path, policy.rules), false, `${path} rides the code lane`);
+    }
+    assert.equal(hasPrefix("docs: clarify the README", policy.prefixes), true);
+    for (const subject of ["test: add a case", "build: bump node", "Docs cleanup"]) {
+      assert.equal(hasPrefix(subject, policy.prefixes), false, `'${subject}' is not a docs subject`);
+    }
+    assert.equal(policy.dispatchWithoutPr.mode, "refuse");
+  });
+
+  test("re-runs on retarget, and holds read-only permissions", () => {
+    // `edited` is load-bearing: a retarget changes the measured diff while
+    // the head -- and any `lanes` check already minted on it -- stays put.
+    assert.match(workflow, /types: \[opened, synchronize, reopened, edited\]/);
+    assert.match(workflow, /\npermissions:\n {2}contents: read\n {2}pull-requests: read\n/);
+    assert.doesNotMatch(workflow, /: write/);
   });
 });
 
@@ -234,31 +327,35 @@ describe("the zizmor workflow", () => {
     assert.strictEqual([...workflow.matchAll(/^ *permissions:/gm)].length, 1);
   });
 
-  test("re-runs when anything it scans changes", () => {
-    // Unlike a consumer repo's copy of this workflow, this repository IS an
-    // action -- zizmor discovers action metadata recursively from the
-    // repository root, so the filter has to cover a nested action.yml (or
-    // .yaml) too, not just the one at the root, or a PR touching only a
-    // nested one never re-runs the scan. Matched as one contiguous block by
-    // construction, not by scanning for any `paths:` occurrence -- renaming
-    // `pull_request:` to another trigger (or reordering the block) breaks
-    // this exact-structure match, so a `paths:` line can't survive attached
-    // to the wrong trigger.
-    assert.match(
-      workflowRun,
-      /^on:\n {2}push:\n {4}branches: \[main\]\n {4}paths: \['\.github\/\*\*', '\*\*\/action\.yml', '\*\*\/action\.yaml'\]\n {2}pull_request:\n {4}paths: \['\.github\/\*\*', '\*\*\/action\.yml', '\*\*\/action\.yaml'\]\n/m,
-    );
+  test("runs on every pull request and push to main, with no paths filter", () => {
+    // `zizmor` is in the ruleset's required set (piloting the fleet
+    // decision), and a required check must report on every pull request's
+    // head: a workflow filtered out by `paths:` creates NO check run at
+    // all -- unlike a skipped job, which reports "skipped" and satisfies
+    // the ruleset -- so a filter here would leave any PR not touching the
+    // filtered paths unmergeable behind a check nothing reports. Matched
+    // as one contiguous block so a `paths:` line can't survive attached
+    // to either trigger.
+    // The block must run straight from `on:` into `permissions:`, so
+    // `pull_request:` provably carries NO nested configuration -- not just
+    // no `paths:`: a `types:` filter under it would equally stop the check
+    // reporting on opened or synchronized heads.
+    assert.match(workflowRun, /^on:\n {2}push:\n {4}branches: \[main\]\n {2}pull_request:\npermissions:\n/m);
+    assert.doesNotMatch(workflowRun, /paths:/);
   });
 
   test("holds the pin-policy table exact", () => {
     // `@main` is the release for mikelward/codex-review, this repository's
-    // one sibling action; official actions may pin tags; the blanket
-    // hash-pin rule has to be restated because supplying policies replaces
-    // zizmor's defaults. Compared whole: an entry added, dropped, or
-    // widened (say, mikelward/*) fails here, whichever shape it takes.
+    // one sibling action, and for this repository's own action, which ci.yml
+    // runs on itself at `@main` deliberately (see SPEC.md); official actions
+    // may pin tags; the blanket hash-pin rule has to be restated because
+    // supplying policies replaces zizmor's defaults. Compared whole: an
+    // entry added, dropped, or widened (say, mikelward/*) fails here,
+    // whichever shape it takes.
     assert.deepStrictEqual(policyEntries(policyRules), [
       "mikelward/codex-review: ref-pin",
       "mikelward/codex-review/.github/workflows/check-consumer.yml: ref-pin",
+      "mikelward/lanes: ref-pin",
       "actions/*: ref-pin",
       "*: hash-pin",
     ]);
