@@ -328,8 +328,8 @@ describe("the zizmor workflow", () => {
   });
 
   test("runs on every pull request and push to main, with no paths filter", () => {
-    // `zizmor` is in the ruleset's required set (piloting the fleet
-    // decision), and a required check must report on every pull request's
+    // `zizmor` is slated for the ruleset's required set (TODO.md holds
+    // the flip), and a required check must report on every pull request's
     // head: a workflow filtered out by `paths:` creates NO check run at
     // all -- unlike a skipped job, which reports "skipped" and satisfies
     // the ruleset -- so a filter here would leave any PR not touching the
@@ -337,10 +337,17 @@ describe("the zizmor workflow", () => {
     // as one contiguous block so a `paths:` line can't survive attached
     // to either trigger.
     // The block must run straight from `on:` into `permissions:`, so
-    // `pull_request:` provably carries NO nested configuration -- not just
-    // no `paths:`: a `types:` filter under it would equally stop the check
-    // reporting on opened or synchronized heads.
-    assert.match(workflowRun, /^on:\n {2}push:\n {4}branches: \[main\]\n {2}pull_request:\npermissions:\n/m);
+    // `pull_request:` provably carries exactly one nested key: the
+    // explicit types list, `edited` included -- a retarget regenerates
+    // the merge ref against the new base while the head (and the green
+    // check attached to it) stays put, so the default types, which lack
+    // `edited`, would let the old target's scan satisfy the new one.
+    // Anything else nested there, a `paths:` filter above all, breaks
+    // the contiguous match.
+    assert.match(
+      workflowRun,
+      /^on:\n {2}push:\n {4}branches: \[main\]\n {2}pull_request:\n {4}types: \[opened, synchronize, reopened, edited\]\npermissions:\n/m,
+    );
     assert.doesNotMatch(workflowRun, /paths:/);
   });
 
