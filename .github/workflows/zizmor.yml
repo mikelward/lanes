@@ -2,7 +2,9 @@
 #
 # Required, not advisory -- reversing the posture this was ported with, by
 # the owner's decision: `zizmor` joins `lanes` and `codex` in the fleet's
-# standard required set, piloted here. That is why there is no `paths:`
+# standard required set (the ruleset half is TODO.md's pending step:
+# until the ruleset itself lists `zizmor`, a red scan does not yet hold
+# merges), piloted here. That is why there is no `paths:`
 # filter: a workflow filtered out by paths creates NO check run at all
 # (unlike a skipped job, which reports "skipped" and satisfies a ruleset),
 # so a required `zizmor` plus a path filter would leave any pull request
@@ -20,13 +22,21 @@
 # in well under a minute; the 5-minute timeout is headroom for a slow PyPI
 # resolve, not the expected case. The one failure mode is a PyPI outage:
 # fetching zizmor is the only network step (--offline covers the scan
-# itself), and with this check required, an outage fails the check and
+# itself), and once the check is required, an outage fails it and
 # holds merges until a re-run succeeds -- accepted with the decision above.
+#
+# `pull_request` lists its types explicitly because the default set lacks
+# `edited`: a retarget regenerates the merge ref against the new base while
+# the head -- and the green `zizmor` check already attached to it -- stays
+# put, so without `edited` the old target's scan would satisfy the new one
+# unexamined. Title and body edits re-run the scan too; redundant but
+# cheap, the same trade ci.yml makes for the lane jobs.
 name: zizmor
 on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, edited]
 permissions:
   contents: read
 jobs:
