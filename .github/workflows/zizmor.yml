@@ -2,10 +2,9 @@
 #
 # Required, not advisory -- reversing the posture this was ported with, by
 # the owner's decision: `zizmor` joins `lanes` and `codex` in the fleet's
-# standard required set (the ruleset half is TODO.md's pending step:
-# until the ruleset itself lists `zizmor`, a red scan does not yet hold
-# merges), piloted here. That is why there is no `paths:`
-# filter: a workflow filtered out by paths creates NO check run at all
+# standard required set, piloted here and now in the main ruleset. That
+# is why there is no `paths:` filter: a workflow filtered out by paths
+# creates NO check run at all
 # (unlike a skipped job, which reports "skipped" and satisfies a ruleset),
 # so a required `zizmor` plus a path filter would leave any pull request
 # not touching `.github/**` waiting forever on a check nothing reports.

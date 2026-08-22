@@ -145,14 +145,15 @@ describe("this repository's own lane", () => {
     assert.match(workflow, /results: >-\n {12}test=\$\{\{ needs\.test\.result \}\}/);
   });
 
-  test("the suite runs unconditionally until the ruleset requires lanes", () => {
-    // Deliberately staged: while the ruleset still requires `test`, a
-    // skipped `test` counts as satisfied with nothing re-verifying the
-    // skip -- so the docs-only skip lands only after the flip to requiring
-    // `lanes`. TODO.md holds the sequence; this pin flips with it, to
-    // `if: needs.classify.outputs.docs_only != 'true'` on the test job.
+  test("the test job skips on a docs-only diff, now that the ruleset requires lanes", () => {
+    // Safe now that the main ruleset requires `lanes`, not `test`, directly:
+    // `lanes` re-derives the classification itself (`mode: gate`) rather
+    // than trusting classify's output, so a skipped `test` no longer
+    // satisfies anything by itself.
     assert.match(workflow, /mode: classify/);
-    assert.doesNotMatch(workflow, /needs\.classify\.outputs\.docs_only/);
+    const testBlock = jobBlock("test");
+    assert.match(testBlock, /needs: classify/);
+    assert.match(testBlock, /if: needs\.classify\.outputs\.docs_only != 'true'/);
   });
 
   test("the actual policy classifies both directions under the real engine", () => {
@@ -165,13 +166,17 @@ describe("this repository's own lane", () => {
     const policy = parsePolicy(readPolicy(fileURLToPath(new URL("./", import.meta.url))));
     assert.ok(policy.rules.length > 0, "the policy parse found rules");
     assert.ok(policy.prefixes.length > 0, "the policy parse found prefixes");
-    for (const path of ["README.md", "SPEC.md", "AGENTS.md", "TODO.md", "docs/notes.md"]) {
+    for (const path of ["SPEC.md", "AGENTS.md", "TODO.md", "docs/notes.md"]) {
       assert.equal(isDocs(path, policy.rules), true, `${path} rides the docs lane`);
     }
     // The code direction includes the engine, the manifest, the workflows,
     // a non-markdown prose file, and the policy file itself, which the
-    // engine hard-codes as code whatever the policy says.
-    for (const path of ["lanes.mjs", "action.yml", ".github/workflows/ci.yml", "LICENSE", POLICY_PATH]) {
+    // engine hard-codes as code whatever the policy says -- plus README.md,
+    // which is markdown but not merely prose: workflows.test.mjs reads and
+    // asserts on its content, so a docs-only skip on a README edit would
+    // let a broken consumer-facing example merge untested (README.md's own
+    // "Writing your policy" section documents exactly this trap).
+    for (const path of ["lanes.mjs", "action.yml", ".github/workflows/ci.yml", "LICENSE", "README.md", POLICY_PATH]) {
       assert.equal(isDocs(path, policy.rules), false, `${path} rides the code lane`);
     }
     assert.equal(hasPrefix("docs: clarify the README", policy.prefixes), true);
@@ -328,9 +333,9 @@ describe("the zizmor workflow", () => {
   });
 
   test("runs on every pull request and push to main, with no paths filter", () => {
-    // `zizmor` is slated for the ruleset's required set (TODO.md holds
-    // the flip), and a required check must report on every pull request's
-    // head: a workflow filtered out by `paths:` creates NO check run at
+    // `zizmor` is in the ruleset's required set, and a required check must
+    // report on every pull request's head: a workflow filtered out by
+    // `paths:` creates NO check run at
     // all -- unlike a skipped job, which reports "skipped" and satisfies
     // the ruleset -- so a filter here would leave any PR not touching the
     // filtered paths unmergeable behind a check nothing reports. Matched
