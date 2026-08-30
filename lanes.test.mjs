@@ -195,9 +195,34 @@ describe("patterns", () => {
     assert.equal(isDocs("other/DESIGN.md", rules), false);
   });
 
+  // This is the `docs/*.md` trap README.md names, asserted rather than only
+  // described: the rule looks like it means "the docs tree" and means "the top
+  // of the docs tree". The standard writes `docs/**/*.md` for that reason; the
+  // test below covers it.
   test("one level needs its own rule, and stops at one level", () => {
     assert.equal(isDocs("docs/DESIGN.md", rules), true);
-    assert.equal(isDocs("docs/a/B.md", rules), false);
+    assert.equal(isDocs("docs/a/B.md", rules), false, "the trap: nested docs fall to code");
+  });
+
+  // The standard README.md recommends, asserted as a pair rather than as two
+  // patterns read in isolation: the root rule must NOT cross `/` and the tree
+  // rule must, and neither may reach a markdown file inside a source tree.
+  // Without this, the two traps the README names -- `docs/*.md`, which strands
+  // nested documentation on the code lane, and `**/*.md`, which makes a
+  // markdown build input documentation at any depth -- are described in prose
+  // and checked nowhere.
+  test("the recommended standard reaches every depth below docs/ and nowhere else", () => {
+    const r = parsePolicy("docs *.md\ndocs docs/**/*.md\nprefixes docs\n").rules;
+    assert.equal(isDocs("README.md", r), true, "root");
+    assert.equal(isDocs("docs/DESIGN.md", r), true, "docs/ top level");
+    assert.equal(isDocs("docs/play-store/README.md", r), true, "nested under docs/");
+    assert.equal(isDocs("docs/a/b/c/D.md", r), true, "arbitrarily deep under docs/");
+    // The property the standard exists for: markdown inside a source tree is
+    // a build input, and stays code however deep it sits.
+    assert.equal(isDocs("app/README.md", r), false, "inside a source tree");
+    assert.equal(isDocs("a/b/notdocs/C.md", r), false, "a `docs`-less tree");
+    assert.equal(isDocs("notdocs/README.md", r), false, "a sibling of docs/");
+    assert.equal(isDocs("docs/asset.json", r), false, "not markdown");
   });
 
   test("** spans any depth, including zero segments", () => {

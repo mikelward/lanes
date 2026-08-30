@@ -53,7 +53,7 @@ recognizes.
 # Ordered: the FIRST matching rule wins, and anything matching no rule is code.
 code docs/REFERENCE.md    # compiled in by a test; see the trap below
 docs *.md
-docs docs/*.md
+docs docs/**/*.md        # `**`, not `*` -- see "Writing your policy" below
 
 # Commit-subject prefixes the docs lane accepts. On that lane every commit
 # must carry one, so nothing riding it reads like a behavior change.
@@ -98,6 +98,7 @@ standard implementation gets right without being asked:
 |---|---|
 | `*.md` | `README.md` — **not** `docs/DESIGN.md` |
 | `docs/*.md` | `docs/DESIGN.md` — **not** `docs/a/B.md` |
+| `docs/**/*.md` | markdown at any depth below `docs/`, and nowhere else |
 | `**/*.md` | markdown at any depth, `README.md` included |
 | `docs/**` | everything under `docs/` |
 
@@ -546,15 +547,23 @@ Start with markdown, and keep it boring:
 
 ```
 docs *.md
-docs docs/*.md
+docs docs/**/*.md
 prefixes docs test build
 ```
 
 **That pair is the standard, and it is deliberately narrow.** Markdown at the
 repository root — `README.md`, `SPEC.md`, `TODO.md`, the agent guide — and
-markdown in a dedicated `docs/` tree are documentation. Everything else is
-code until a rule says otherwise, and `*` never crosses `/`, so neither
-pattern reaches a `.md` file sitting inside a source tree.
+markdown anywhere in a dedicated `docs/` tree are documentation. Everything
+else is code until a rule says otherwise.
+
+Note the asymmetry, because it is easy to get backwards: the root rule is
+`*.md`, which does **not** cross `/`, so it reaches exactly the root and no
+further. The tree rule is `docs/**/*.md`, which **does**, so it reaches every
+depth *below `docs/`* and nowhere else. Writing the tree rule as `docs/*.md`
+looks tidier and is a trap — it silently puts `docs/play-store/README.md` on
+the code lane, which is a documentation file by anyone's reading. Neither
+pattern reaches a `.md` file sitting inside a source tree, which is the
+property that matters.
 
 `docs **/*.md` is the tempting shorthand and it is wider than it looks: it
 makes every markdown file documentation at every depth, including one a build
