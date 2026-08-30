@@ -24,6 +24,7 @@ import {
   changedPaths,
   classify,
   classifyOrCode,
+  pushedPaths,
   gate,
   isDocs,
   lintPrefixes,
@@ -65,6 +66,9 @@ function stub({
   baseRef = "main",
   tip = "basetip",
   compare = "ahead",
+  compareFiles,
+  compareCommits,
+  nCompareCommits,
   defaultBranchName = "main",
 } = {}) {
   const routes = [
@@ -72,7 +76,28 @@ function stub({
     [/\/pulls\/\d+\/commits/, () => commits],
     [/\/commits\/[^/]+\/pulls/, () => pulls ?? [{ state: "open", head: { sha: headSha }, number: 1 }]],
     [/\/git\/ref\/heads\//, () => ({ object: { sha: tip } })],
-    [/\/compare\//, () => ({ status: compare })],
+    // `files` is present only when a case asks for it: `baseMovement` reads
+    // nothing but `status`, and a range test that forgot to supply files must
+    // see the "no file list" refusal rather than an empty-and-therefore-docs
+    // answer it never wrote.
+    [
+      /\/compare\//,
+      () => {
+        const body = { status: compare };
+        // Each half is present only when a case asks for it: `baseMovement`
+        // reads nothing but `status`, and a range test that forgot to supply
+        // one must see the "no list" refusal rather than an empty-and-
+        // therefore-clean answer it never wrote.
+        if (compareFiles !== undefined) body.files = compareFiles;
+        if (compareCommits !== undefined) {
+          body.commits = compareCommits;
+          body.total_commits = nCompareCommits === undefined ? compareCommits.length : nCompareCommits;
+        } else if (nCompareCommits !== undefined) {
+          body.total_commits = nCompareCommits;
+        }
+        return body;
+      },
+    ],
     // A bare `/repos/owner/repo` -- nothing after it -- is the repository
     // object itself, the only route `defaultBranch` calls.
     [/^\/repos\/[^/]+\/[^/]+$/, () => ({ default_branch: defaultBranchName })],
@@ -111,11 +136,30 @@ const PR_TARGET_ENV = {
   snapshot: { number: 1 },
 };
 
+// A push names no pull request; its range comes from the payload alone.
+const PUSH_ENV = {
+  event: "push",
+  pr: "",
+  ref: "refs/heads/main",
+  sha: "newtip",
+  snapshot: { before: "oldtip", after: "newtip", forced: false },
+};
+
 const POLICY = parsePolicy(`
 code docs/REFERENCE.md
 docs *.md
 docs docs/*.md
 prefixes design docs todo test build refactor
+`);
+
+// The same rules, opted in to the push lane -- so a difference between the
+// two is the directive and nothing else.
+const PUSH_POLICY = parsePolicy(`
+code docs/REFERENCE.md
+docs *.md
+docs docs/*.md
+prefixes design docs todo test build refactor
+push classify
 `);
 
 /** A temp repo whose policy path can be staged as file, link, or missing. */
@@ -245,6 +289,20 @@ describe("policy parsing", () => {
       () => parsePolicy("docs *.md\nprefixes docs\ndispatch-without-pr maybe\n"),
       /takes refuse, allow, or allow-on-default-branch/,
     );
+    // The push lane is opt-in and defaults to the behavior every consumer has
+    // today, so assert the default as well as the setting -- a directive that
+    // silently already applied is the change nobody reviewed.
+    assert.equal(parsePolicy("docs *.md\nprefixes docs\n").pushLane, "code");
+    assert.equal(parsePolicy("docs *.md\nprefixes docs\npush classify\n").pushLane, "classify");
+    assert.equal(parsePolicy("docs *.md\nprefixes docs\npush code\n").pushLane, "code");
+    assert.throws(() => parsePolicy("docs *.md\nprefixes docs\npush maybe\n"), /takes code or classify/);
+    // Not silently ignored: a typo'd argument that fell through would leave a
+    // policy quietly doing less than it says.
+    assert.throws(() => parsePolicy("docs *.md\nprefixes docs\npush\n"), /takes code or classify/);
+    assert.throws(
+      () => parsePolicy("docs *.md\nprefixes docs\npush classify extra\n"),
+      /takes code or classify/,
+    );
     // No argument, on purpose: a policy-supplied branch name is exactly the
     // untrusted input this mode exists to avoid -- see `defaultBranch`.
     assert.throws(
@@ -285,6 +343,57 @@ describe("reading the policy", () => {
 // The light lane is a privilege, and an unverifiable retarget story is enough
 // to withhold it. Refusing at the gate instead would red a required check over
 // YAML this cannot parse; running the heavy jobs is never a lockout.
+describe("the pushed range", () => {
+  const range = (opts) => pushedPaths("oldtip", "newtip", ctx(opts));
+
+  test("a fast-forward push yields both sides of every entry", async () => {
+    assert.deepEqual(await range({ compareFiles: named("README.md", "src/a.rs") }), ["README.md", "src/a.rs"]);
+    // A source file renamed into docs/ is a code change, and judging only the
+    // new side would miss the deletion -- same rule `changedPaths` follows.
+    const renamed = [{ filename: "docs/A.md", previous_filename: "src/a.rs" }];
+    assert.deepEqual(await range({ compareFiles: renamed }), ["docs/A.md", "src/a.rs"]);
+  });
+
+  test("a branch's first push has no range to classify", async () => {
+    // GitHub spells "there was no previous tip" as an all-zero sha, so the
+    // check is on the value, not just on absence.
+    await assert.rejects(pushedPaths("0".repeat(40), "newtip", ctx({})), /no previous tip/);
+    await assert.rejects(pushedPaths("", "newtip", ctx({})), /no previous tip/);
+    await assert.rejects(pushedPaths(null, "newtip", ctx({})), /no previous tip/);
+  });
+
+  test("an empty range is refused", async () => {
+    await assert.rejects(pushedPaths("same", "same", ctx({})), /empty range/);
+  });
+
+  test("only a strictly-ahead comparison is a range this push added", async () => {
+    // The ancestry question `baseAdvancedOnly` asks of a moving base, asked
+    // here for the same reason: a rewrite substitutes what is being judged.
+    for (const status of ["behind", "diverged", "identical"]) {
+      await assert.rejects(
+        range({ compare: status, compareFiles: named("README.md") }),
+        /rather than ahead of it/,
+      );
+    }
+    assert.deepEqual(await range({ compare: "ahead", compareFiles: named("README.md") }), ["README.md"]);
+  });
+
+  test("a comparison with no file list is refused, not read as empty", async () => {
+    // Empty would classify as code by a different route and look like a
+    // working guard; the point is that an unknown diff refuses outright.
+    await assert.rejects(range({}), /no file list/);
+  });
+
+  test("a file list at the page cap is refused, since nothing reconciles it", async () => {
+    // Unlike `pulls/N/files`, compare reports no total to check a page
+    // against -- so at the cap the list may be a clean-looking prefix.
+    const many = named(...Array.from({ length: 300 }, (_, i) => `docs/f${i}.md`));
+    await assert.rejects(range({ compareFiles: many }), /possibly-truncated/);
+    // One under the cap is a list that cannot have been truncated.
+    assert.equal((await range({ compareFiles: many.slice(0, 299) })).length, 299);
+  });
+});
+
 describe("classify", () => {
   test("a markdown-only diff is docs", async () => {
     assert.equal(await classify(PR_ENV, POLICY, ctx({ files: named("README.md", "docs/DESIGN.md") })), true);
@@ -338,6 +447,86 @@ describe("classify", () => {
 
   test("a non-pull-request event is code", async () => {
     assert.equal(await classify({ ...PR_ENV, event: "push" }, POLICY, ctx({ files: named("README.md") })), false);
+  });
+
+  test("a push is code while the policy has not opted in", async () => {
+    // Both directions of the opt-in, on the SAME docs-only range: the default
+    // must answer code, and it must be the policy that changed the answer --
+    // not the fixture. Every consumer tracks `@main`, so a default that
+    // classified would start skipping jobs on repositories that never asked.
+    const docsPush = ctx({ compareFiles: named("README.md") });
+    assert.equal(await classify(PUSH_ENV, POLICY, docsPush), false);
+    assert.equal(await classify(PUSH_ENV, PUSH_POLICY, ctx({ compareFiles: named("README.md") })), true);
+  });
+
+  test("an opted-in push classifies its own range", async () => {
+    assert.equal(
+      await classify(PUSH_ENV, PUSH_POLICY, ctx({ compareFiles: named("README.md", "docs/DESIGN.md") })),
+      true,
+    );
+    assert.equal(
+      await classify(PUSH_ENV, PUSH_POLICY, ctx({ compareFiles: named("README.md", "src/main.rs") })),
+      false,
+    );
+  });
+
+  test("a push with no event payload cannot be classified", async () => {
+    // The range lives only in the payload, so its absence is a refusal rather
+    // than a fallback onto some other diff.
+    await assert.rejects(
+      classify({ ...PUSH_ENV, snapshot: null }, PUSH_POLICY, ctx({ compareFiles: named("README.md") })),
+      /without its event payload/,
+    );
+  });
+
+  test("a branch deletion is refused, not classified against the default tip", async () => {
+    // The failure this exists for: on a DELETION the payload's `after` is all
+    // zeros while Actions still sets GITHUB_SHA to the default branch's tip.
+    // Substituting it compares `before...default-tip` -- a range the push
+    // never introduced -- and in the routine case of deleting an
+    // already-merged branch that comparison is `ahead`, so it would classify
+    // and could skip on someone else's commits.
+    const deleted = { ...PUSH_ENV, snapshot: { before: "oldtip", after: "0".repeat(40), forced: false } };
+    await assert.rejects(
+      classify(deleted, PUSH_POLICY, ctx({ compareFiles: named("README.md") })),
+      /no resulting tip/,
+    );
+    // Absent is refused the same way, never read as "use GITHUB_SHA".
+    await assert.rejects(
+      classify(
+        { ...PUSH_ENV, snapshot: { before: "oldtip", after: null, forced: false } },
+        PUSH_POLICY,
+        ctx({ compareFiles: named("README.md") }),
+      ),
+      /no resulting tip/,
+    );
+  });
+
+  test("a push whose landed tip is not this run's commit is refused", async () => {
+    // Proven equal rather than assumed: the verdict labels GITHUB_SHA, so a
+    // range ending anywhere else is a range for a different commit.
+    await assert.rejects(
+      classify(
+        { ...PUSH_ENV, snapshot: { before: "oldtip", after: "somewhereelse", forced: false } },
+        PUSH_POLICY,
+        ctx({ compareFiles: named("README.md") }),
+      ),
+      /but this run reports for/,
+    );
+    // And the matching case still classifies, so this is a guard and not a
+    // blanket refusal of the push lane.
+    assert.equal(await classify(PUSH_ENV, PUSH_POLICY, ctx({ compareFiles: named("README.md") })), true);
+  });
+
+  test("a force-push is refused before the range is even read", async () => {
+    await assert.rejects(
+      classify(
+        { ...PUSH_ENV, snapshot: { before: "oldtip", after: "newtip", forced: true } },
+        PUSH_POLICY,
+        ctx({ compareFiles: named("README.md") }),
+      ),
+      /force-push/,
+    );
   });
 
   test("pull_request_target classifies the same way pull_request does", async () => {
@@ -529,7 +718,10 @@ describe("a dispatched run needs a base recorded before it is measured", () => {
 
   test("a push-event green with no pull request is untouched", async () => {
     // The refusal is about a PR-bound dispatch, not about every pin-less run.
-    await gate({ ...green, event: "push", pr: "" }, POLICY, ctx(), null);
+    // `pulls: []` because this commit must head nothing -- `settlePush` has a
+    // separate refusal for one that does, asserted in its own test below, and
+    // the default fixture happens to trip it.
+    await gate({ ...green, event: "push", pr: "" }, POLICY, ctx({ pulls: [] }), null);
   });
 });
 
@@ -583,6 +775,181 @@ describe("gate", () => {
 
   test("a justified skip with prefixed commits passes", async () => {
     await assert.doesNotReject(gate(skipped, POLICY, docsCtx()));
+  });
+
+  const pushEnv = (over = {}) => ({
+    event: "push",
+    pr: "",
+    sha: "newtip",
+    snapshot: { before: "oldtip", after: "newtip", forced: false },
+    classifyResult: "success",
+    ...over,
+  });
+  const subjects = (...lines) => lines.map((message) => ({ commit: { message }, parents: [{}] }));
+  const pushCtx = (over = {}) =>
+    ctx({
+      compareFiles: named("README.md"),
+      compareCommits: subjects("docs: say it better"),
+      // A pushed commit heading no open pull request is the ordinary case;
+      // the one that does has its own test.
+      pulls: [],
+      ...over,
+    });
+
+  test("a push settles on both terminal paths, having nothing to pin", async () => {
+    // What every consumer already does -- `if: always()` fires this job on a
+    // push to the default branch -- and it must keep returning cleanly rather
+    // than redding a check on a ref where nothing requires one.
+    await gate(pushEnv({ results: "check=success" }), PUSH_POLICY, pushCtx());
+    // The skip path, which a docs-only push reaches for the first time once
+    // the push lane is in force. It must not go on to lint prefixes against a
+    // pull request number that does not exist.
+    await gate(pushEnv({ results: "check=skipped" }), PUSH_POLICY, pushCtx());
+  });
+
+  test("a push's results are validated before it settles", async () => {
+    // The push branch sits AFTER `parseResults` and after the failure check,
+    // not before them. An earlier revision returned first, so `check=failure`
+    // -- or a results input naming nothing at all -- reported success for a
+    // commit whose heavy jobs had failed, and with App credentials published
+    // that as a status. A status and a check run are both per-commit, so that
+    // green would satisfy the required check of any pull request whose head
+    // had caught up to the pushed commit.
+    await assert.rejects(
+      gate(pushEnv({ results: "check=failure" }), PUSH_POLICY, pushCtx()),
+      /not all green, and not a justified skip/,
+    );
+    await assert.rejects(
+      gate(pushEnv({ results: "check=success other=failure" }), PUSH_POLICY, pushCtx()),
+      /not all green, and not a justified skip/,
+    );
+    await assert.rejects(gate(pushEnv({ results: "  " }), PUSH_POLICY, pushCtx()), /named no heavy jobs/);
+    await assert.rejects(gate(pushEnv({ results: "" }), PUSH_POLICY, pushCtx()), /named no heavy jobs/);
+    // A classify job that failed still reds it, on a push like anywhere.
+    await assert.rejects(
+      gate(pushEnv({ results: "check=skipped", classifyResult: "failure" }), PUSH_POLICY, pushCtx()),
+      /nothing vouches/,
+    );
+  });
+
+  test("a push skip lints the range's own subjects", async () => {
+    // An earlier revision returned here, on the reasoning that a pull request
+    // had already linted every subject in the range. That is an assumption
+    // about the CONSUMER's branch protection, and this engine knows nothing
+    // about a repository beyond its policy -- so where direct pushes to the
+    // default branch are allowed, an unprefixed docs-only push skipped the
+    // heavy jobs and passed the gate while breaking the every-commit rule.
+    await assert.rejects(
+      gate(
+        pushEnv({ results: "check=skipped" }),
+        PUSH_POLICY,
+        pushCtx({ compareCommits: subjects("Reword the readme") }),
+      ),
+      /commit subject lacks a prefix: 'Reword the readme'/,
+    );
+    // A prefixed one still passes, so this is a lint and not a blanket
+    // refusal of the push skip.
+    await gate(
+      pushEnv({ results: "check=skipped" }),
+      PUSH_POLICY,
+      pushCtx({ compareCommits: subjects("docs: reword the readme") }),
+    );
+    // A merge commit is exempt structurally, by parent count, exactly as on
+    // the pull request lane -- not by its subject reading "Merge".
+    await gate(
+      pushEnv({ results: "check=skipped" }),
+      PUSH_POLICY,
+      pushCtx({
+        compareCommits: [
+          { commit: { message: "Merge pull request #1" }, parents: [{}, {}] },
+          ...subjects("docs: reword the readme"),
+        ],
+      }),
+    );
+    // The all-green path lints nothing: the heavy jobs ran, so no subject is
+    // claiming a skip it has to justify.
+    await gate(
+      pushEnv({ results: "check=success" }),
+      PUSH_POLICY,
+      pushCtx({ compareCommits: subjects("Reword the readme") }),
+    );
+  });
+
+  test("a push skip fails closed when the commit list cannot be established", async () => {
+    // The one place the compare endpoint beats its own file list: it reports
+    // `total_commits`, so this list gets the reconciliation `changedPaths`
+    // has and `pushedPaths` cannot.
+    await assert.rejects(
+      gate(
+        pushEnv({ results: "check=skipped" }),
+        PUSH_POLICY,
+        pushCtx({ compareCommits: subjects("docs: a"), nCompareCommits: 250 }),
+      ),
+      /Commit list incomplete: listed 1 of 250/,
+    );
+    await assert.rejects(
+      gate(
+        pushEnv({ results: "check=skipped" }),
+        PUSH_POLICY,
+        pushCtx({ compareCommits: subjects("docs: a"), nCompareCommits: null }),
+      ),
+      /comparison reported an unreadable commit count/,
+    );
+    // Absent entirely is refused too, never read as an empty-and-clean list.
+    await assert.rejects(
+      gate(
+        pushEnv({ results: "check=skipped" }),
+        PUSH_POLICY,
+        ctx({ compareFiles: named("README.md"), pulls: [] }),
+      ),
+      /unreadable commit count|no commit list/,
+    );
+  });
+
+  test("a push never reports for a commit that heads an open pull request", async () => {
+    // The finding this exists for, and the reason it is not enough that the
+    // reported result be TRUE about the range: a push's range is not a pull
+    // request's diff. One final documentation commit pushed onto a branch has
+    // a docs-only range and is honestly green about it, while the pull
+    // request whose head that commit now is carries a complete diff of
+    // untested code. A status and a check run are both per-commit, so that
+    // green satisfies the pull request's required check without its diff ever
+    // being classified or bound.
+    const heads = [{ state: "open", head: { sha: "newtip" }, number: 7 }];
+    await assert.rejects(
+      gate(pushEnv({ results: "check=skipped" }), PUSH_POLICY, pushCtx({ pulls: heads })),
+      /heads open pull request\(s\) \[7\]/,
+    );
+    // Both terminal paths, not just the skip: an all-green push publishes for
+    // that same commit and satisfies that same required check.
+    await assert.rejects(
+      gate(pushEnv({ results: "check=success" }), PUSH_POLICY, pushCtx({ pulls: heads })),
+      /heads open pull request\(s\) \[7\]/,
+    );
+    // A pull request whose head is some OTHER commit does not block it --
+    // the check is about this commit, not about the repository being busy.
+    const elsewhere = [{ state: "open", head: { sha: "othertip" }, number: 7 }];
+    await gate(pushEnv({ results: "check=success" }), PUSH_POLICY, pushCtx({ pulls: elsewhere }));
+  });
+
+  test("a push skip is refused when the range is not docs-only", async () => {
+    // The skip is only as good as the reason for it, re-derived here
+    // independently of the output that caused it -- the same rule the pull
+    // request lane follows, and the reason the push branch sits after the
+    // re-derivation rather than before it.
+    await assert.rejects(
+      gate(
+        pushEnv({ results: "check=skipped" }),
+        PUSH_POLICY,
+        pushCtx({ compareFiles: named("src/main.rs") }),
+      ),
+      /could not be verified as docs-only/,
+    );
+    // And when the range cannot be established at all.
+    await assert.rejects(
+      gate(pushEnv({ results: "check=skipped", snapshot: { before: "oldtip", after: "newtip", forced: true } }), PUSH_POLICY, pushCtx()),
+      /force-push/,
+    );
   });
 
   test("a failed classify fails the gate", async () => {
@@ -727,6 +1094,24 @@ describe("a classification that cannot be established", () => {
   // cost rounds of, so the wrapper takes the whole path.
   const broken = { token: "t", repo: "example/repo", fetchImpl: async () => { throw new Error("network down"); } };
 
+  test("a push range that cannot be established is code", async () => {
+    // Every new way `classify` can throw has to land inside the same
+    // wrapper -- the enumerate-the-routes mistake this rule exists to stop.
+    const said = [];
+    const forced = { ...PUSH_ENV, snapshot: { before: "oldtip", after: "newtip", forced: true } };
+    assert.equal(
+      await classifyOrCode(() => classify(forced, PUSH_POLICY, ctx({})), (m) => said.push(m)),
+      false,
+    );
+    assert.match(said.join(""), /::warning::Could not establish a docs-only diff/);
+    // Not a blanket false: the same wrapper still answers true for a range it
+    // can establish, so the fallback is the failure path and not the only one.
+    assert.equal(
+      await classifyOrCode(() => classify(PUSH_ENV, PUSH_POLICY, ctx({ compareFiles: named("README.md") }))),
+      true,
+    );
+  });
+
   test("a failure anywhere in the path reports the code lane, and says why", async () => {
     const said = [];
     const failed = await classifyOrCode(() => classify(PR_ENV, POLICY, broken), (m) => said.push(m));
@@ -865,8 +1250,17 @@ describe("the entry point", () => {
       INPUT_MODE: "gate",
       INPUT_RESULTS: "check=success",
     };
+    // Asserted on the MESSAGE, not the exit code. The gate's push path now
+    // settles against the API, so the runner's spelling no longer exits 0
+    // offline -- but what this test is about is which input NAME reached the
+    // engine, and the message is what proves it: the runner's spelling gets
+    // past the classify-result check, the misspelling is stopped by it.
     const real = runEntry({ ...env, "INPUT_CLASSIFY-RESULT": "success" });
-    assert.equal(real.status, 0, `${real.stdout}${real.stderr}`);
+    assert.doesNotMatch(
+      real.stdout,
+      /classify did not succeed/,
+      `the runner's spelling did not reach the engine: ${real.stdout}${real.stderr}`,
+    );
     const misspelled = runEntry({ ...env, INPUT_CLASSIFY_RESULT: "success" });
     assert.notEqual(misspelled.status, 0, "the underscore spelling is not what the runner sets");
     assert.match(misspelled.stdout, /::error::.*classify did not succeed/);
@@ -901,11 +1295,38 @@ describe("the event snapshot", () => {
       repository: { default_branch: "main" },
     });
     assert.deepEqual(eventSnapshot({ GITHUB_EVENT_PATH: path }), {
+      before: null,
+      after: null,
+      forced: false,
       number: 7,
       head: "abc",
       baseRef: "topic",
       baseSha: "def",
     });
+  });
+
+  test("a push payload yields the range it introduced", () => {
+    const path = write({ before: "oldtip", after: "newtip", forced: false });
+    const snap = eventSnapshot({ GITHUB_EVENT_PATH: path });
+    assert.equal(snap.before, "oldtip");
+    assert.equal(snap.after, "newtip");
+    assert.equal(snap.forced, false);
+    // The PR fields are absent rather than invented, so a push cannot borrow
+    // a pull request's binding.
+    assert.deepEqual([snap.number, snap.head, snap.baseRef, snap.baseSha], [null, null, null, null]);
+  });
+
+  test("a force-push says so", () => {
+    assert.equal(eventSnapshot({ GITHUB_EVENT_PATH: write({ before: "oldtip", forced: true }) }).forced, true);
+    // Anything but a literal `true` is not a force-push claim: a payload that
+    // stopped setting the field must not read as one, and must not read as a
+    // fast-forward proof either -- the ancestry check in `pushedPaths` is what
+    // actually decides.
+    assert.equal(eventSnapshot({ GITHUB_EVENT_PATH: write({ before: "oldtip" }) }).forced, false);
+    assert.equal(
+      eventSnapshot({ GITHUB_EVENT_PATH: write({ before: "oldtip", forced: "true" }) }).forced,
+      false,
+    );
   });
 
   test("is absent rather than invented when there is no payload", () => {

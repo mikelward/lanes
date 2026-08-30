@@ -15,7 +15,9 @@ inputs:
   pr:
     description: >-
       The pull request number this run reports for. Empty on events that have
-      none, which classify treats as code -- the safe direction. A dispatched
+      none, which classify treats as code -- the safe direction, except on a
+      push, where a policy carrying `push classify` classifies the range the
+      push added instead. A dispatched
       run naming none is refused unless the policy allows it, since nothing
       would bind the verdict to the commit it labels.
     required: false
@@ -77,7 +79,8 @@ outputs:
   docs_only:
     description: >-
       classify mode only. 'true' when every changed path is documentation by
-      the policy's rules and the verdict can be trusted, 'false' otherwise --
+      the policy's rules and the verdict can be trusted -- the pull request's
+      files, or on an opted-in push the range it added -- 'false' otherwise --
       including every failure to establish it, so an unreadable diff runs the
       full lane.
   base_sha:
