@@ -70,6 +70,13 @@ prefixes design docs todo test build refactor
 # let an attacker's own branch simply name itself.
 dispatch-without-pr refuse
 
+# Optional; defaults to `code` -- every push runs the full lane, which is what
+# every consumer does today. `classify` classifies the range the push added
+# (`before...after`) so a documentation-only push to the default branch skips
+# the heavy jobs, judged by the rules above rather than by a second copy of
+# them in an `on: push: paths:` filter. See "Classifying a push" below.
+push code
+
 # Optional; defaults to YES. Whether the PULL REQUEST TITLE must carry a prefix
 # too. Two independent reasons: under a SQUASH merge the title is the subject
 # that lands, so linting only the commits leaves it unchecked; and whatever the
@@ -309,6 +316,95 @@ Steps 1 and 4 are ordinary pull requests; step 3 is the one that touches
 branch protection outside a PR, and it is the only step where getting the
 order wrong reintroduces the block step 1 was there to prevent.
 
+## Classifying a push
+
+A pull request is classified from its own file list. A push has no pull
+request, so by default it is code and runs everything — and that default
+stands until a policy says `push classify`.
+
+**The thing it replaces is an `on: push: paths:` filter.** Without a lane for
+pushes, the only way to keep a documentation-only push to the default branch
+from running a full build is to filter the workflow out of existence at the
+trigger:
+
+```yaml
+on:
+  push:
+    branches: [main]
+    paths: ['**', '!**/*.md', '!.*', '!.*/**', '.github/workflows/**']
+```
+
+That is a **second copy of the docs policy**, written in a different language,
+governing a different question, verified by nothing. Two of them across four
+sibling repositories had already drifted from their own `lanes.conf` — one
+missing the markdown line entirely, one whose module patterns sat *after* the
+markdown exclusion and quietly re-included `app/README.md` — and each
+disagreement is a push that ran when it should not have, or did not when it
+should. Keeping two policies in agreement by hand is the maintenance this
+repository exists to delete.
+
+With `push classify` the filter goes away and the whole decision moves into
+the job graph, where the jobs are already gated on `docs_only`:
+
+```yaml
+on:
+  push:
+    branches: [main]
+```
+
+**What it costs.** A documentation-only push now starts a run — one small
+`classify` job — where the filter started none. What it buys back is every
+push whose paths the filter got wrong: a `.gitignore` or `.claude/**` change
+is code under `lanes.conf` (it matches no rule) and ran nothing under the
+filter, which is a change to what CI itself does, shipped unverified.
+
+**Where it refuses.** The range `before...after` is the push's own account of
+what it added, and it is worth nothing unless the push was a fast-forward.
+Each of these takes the code lane:
+
+| the push | why |
+|---|---|
+| a force-push (`forced`, or a comparison not `ahead`) | the range spans commits the push did not add |
+| a branch's first push (all-zero `before`) | there is no range |
+| a branch **deletion** (all-zero `after`) | nothing was added, and `GITHUB_SHA` is the default branch's tip rather than the range's end |
+| `after` disagreeing with `GITHUB_SHA` | the range would end somewhere other than the commit the verdict labels |
+| `before` unreachable, or any API failure | nothing establishes the diff |
+| a comparison listing 300+ files | the endpoint reports no total to reconcile a page against, so the list may be a truncated prefix — unlike `pulls/N/files`, which is checked against `changed_files` |
+
+The `forced` flag is read as a fast refusal, never as the proof. The proof is
+the ancestry check, for the same reason `baseAdvancedOnly` asks it of a moving
+base: a payload field that quietly stopped being set would otherwise turn the
+guard off while still looking configured.
+
+The last two rows are the same discipline applied to the range's *end*.
+`GITHUB_SHA` is only the pushed tip when the push actually landed one — on a
+deletion Actions sets it to the default branch's tip instead, and comparing
+`before...default-tip` after deleting an already-merged branch is `ahead`, so
+it would classify cleanly against commits the push never introduced. The
+payload's own `after` is kept and proven equal to `GITHUB_SHA` rather than
+assumed to be it.
+
+**A push's skip is checked, but nothing gates on the answer.** The `gate`
+re-derives the classification, lints the range's own commit subjects, and
+refuses outright if the pushed commit heads an open pull request — the one
+thing it drops is the pull request *title* lint, since a push has no title and
+no merge left for one to land as. What is missing is not the checking but the
+consequence: a push has already merged, so there is no merge left to hold. A
+wrong answer here costs a job that did not run, not a merge certified without
+one.
+
+That last refusal is the subtle one, and it is why "the result is true about
+this range" is not enough. **A push's range is not a pull request's diff.** One
+final documentation commit pushed onto a branch has a docs-only range and can
+be honestly green about it, while the pull request whose head that commit now
+is carries a complete diff of untested code. A status and a check run are both
+per-commit, so that green would satisfy the pull request's required check
+without its diff ever being classified. Refusing hands the commit back to the
+pull-request gate, which is the thing responsible for it — the same reason
+`classify` refuses a head shared by two open pull requests. That is a weaker guarantee than the pull-request lane's, and it is
+strictly stronger than the `paths:` filter it replaces, which skips the entire
+run on a policy nothing checks at all.
+
 ## What binds a verdict to the diff it was computed for
 
 A check run lands on a commit, and is read by whatever the pull request looks
@@ -450,8 +546,27 @@ Start with markdown, and keep it boring:
 
 ```
 docs *.md
+docs docs/*.md
 prefixes docs test build
 ```
+
+**That pair is the standard, and it is deliberately narrow.** Markdown at the
+repository root — `README.md`, `SPEC.md`, `TODO.md`, the agent guide — and
+markdown in a dedicated `docs/` tree are documentation. Everything else is
+code until a rule says otherwise, and `*` never crosses `/`, so neither
+pattern reaches a `.md` file sitting inside a source tree.
+
+`docs **/*.md` is the tempting shorthand and it is wider than it looks: it
+makes every markdown file documentation at every depth, including one a build
+or a test reads. Reach for it only with the trap below answered.
+
+A `code` rule over a markdown path is the exception, never the tidy-up. This
+repository has exactly one — `code README.md`, because `workflows.test.mjs`
+parses the consumer template out of it and asserts on its shape, so a
+docs-only skip on a README edit would let a broken consumer-facing example
+merge with the one test that checks it never having run. That is the trap
+below, not a style preference, and it earns its line by having a test that
+goes red without it.
 
 The direction to move in is **narrower, not wider** — ideally only markdown
 under a dedicated `docs/` tree. "Dotfile" is a naming convention rather than a

@@ -105,6 +105,7 @@ export function parsePolicy(text) {
   const rules = [];
   let prefixes = [];
   let dispatchWithoutPr = { mode: "refuse" };
+  let pushLane = "code";
   let lintTitle = "yes";
 
   text.split("\n").forEach((raw, index) => {
@@ -138,6 +139,19 @@ export function parsePolicy(text) {
           );
         }
         lintTitle = argument;
+        break;
+      case "push":
+        // Opt-in, like `dispatch-without-pr`, and for the same reason: every
+        // consumer tracks `@main`, so a default that started classifying push
+        // ranges would silently begin skipping jobs on their next push to the
+        // default branch -- on repositories whose pushes run everything today
+        // and whose authors never asked for a lane there.
+        if (argument !== "code" && argument !== "classify") {
+          throw new PolicyError(
+            `${POLICY_PATH}:${lineno}: 'push' takes code or classify, not '${argument}'.`,
+          );
+        }
+        pushLane = argument;
         break;
       case "dispatch-without-pr": {
         // `allow` is unscoped: any ref a dispatch can name satisfies it, which
@@ -213,7 +227,7 @@ export function parsePolicy(text) {
       `${POLICY_PATH} sets no prefixes — refusing to lint subjects against an empty prefix list.`,
     );
   }
-  return { rules, prefixes, dispatchWithoutPr, lintTitle: lintTitle === "yes" };
+  return { rules, prefixes, dispatchWithoutPr, pushLane, lintTitle: lintTitle === "yes" };
 }
 
 /**
@@ -275,14 +289,14 @@ export async function api(path, { token, repo, fetchImpl = fetch } = {}) {
 }
 
 /** A count the API reported, or a refusal. */
-function requireCount(value, what) {
+function requireCount(value, what, source = "pull request") {
   // A non-numeric total cannot be compared, and "cannot be compared" must
   // never take the same branch as "compared equal" -- in the shell version
   // that comparison exited 2 and an `if` read it as false, silently SKIPPING
   // the reconciliation this exists to perform.
   if (!Number.isInteger(value) || value < 0) {
     throw new PolicyError(
-      `The pull request reported an unreadable ${what} count (${JSON.stringify(value)}) — ` +
+      `The ${source} reported an unreadable ${what} count (${JSON.stringify(value)}) — ` +
         `refusing to classify against a total that cannot be compared.`,
     );
   }
@@ -305,6 +319,97 @@ export async function changedPaths(pr, ctx) {
   // would let a source file renamed into docs/ ride the lane while deleting
   // code.
   return files.flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
+}
+
+/**
+ * The compare endpoint reports no total file count, so there is nothing to
+ * reconcile a page against -- unlike `pulls/N/files`, which `changedPaths`
+ * checks against `changed_files`. It answers with at most this many files
+ * per page and pages no further without being asked, so a diff at or above
+ * the cap is one whose file list may be a clean-looking prefix of the truth.
+ * Refused rather than paged: a push that touches 300 files is not a
+ * documentation push, so refusing costs a lane nobody wanted and buys back
+ * the reconciliation the endpoint cannot offer.
+ */
+const COMPARE_FILE_CAP = 300;
+
+/**
+ * Every path a push introduced, or a hard failure.
+ *
+ * `before...after` is the only account a push gives of its own diff, and it
+ * is meaningful only when the push was a fast-forward: after a force-push the
+ * range spans a history that no longer exists, and `before` may not be
+ * reachable at all. So the range is taken only when the comparison itself
+ * says the head is strictly ahead -- the same ancestry question
+ * `baseAdvancedOnly` asks of a moving base, and asked here for the same
+ * reason: a rewrite silently substitutes what is being judged.
+ *
+ * A branch's first push carries an all-zero `before` and has no range; so
+ * does a push whose `before` equals its head. Neither is a documentation
+ * push that can be proved, and both refuse.
+ */
+export async function pushComparison(before, after, ctx) {
+  if (!before || /^0+$/.test(before)) {
+    throw new PolicyError(
+      `This push reports no previous tip (${JSON.stringify(before)}) — a branch's first push has no ` +
+        `range to classify, so there is nothing to prove documentation-only.`,
+    );
+  }
+  if (before === after) {
+    throw new PolicyError(`This push reports an empty range (${before}) — refusing to classify.`);
+  }
+  const cmp = await api(`compare/${before}...${after}`, ctx);
+  if (cmp.status !== "ahead") {
+    throw new PolicyError(
+      `This push is '${cmp.status}' of its previous tip rather than ahead of it — a rewritten ` +
+        `history's range describes commits this push did not add, so it cannot be classified.`,
+    );
+  }
+  return cmp;
+}
+
+/** Every path a push introduced, or a hard failure. */
+export async function pushedPaths(before, after, ctx) {
+  const files = (await pushComparison(before, after, ctx)).files;
+  if (!Array.isArray(files)) {
+    throw new PolicyError(
+      `The comparison reported no file list — refusing to classify a range whose contents are unknown.`,
+    );
+  }
+  if (files.length >= COMPARE_FILE_CAP) {
+    throw new PolicyError(
+      `The comparison listed ${files.length} files, at or above the ${COMPARE_FILE_CAP}-file page cap, ` +
+        `and reports no total to reconcile against — refusing to classify a possibly-truncated list.`,
+    );
+  }
+  // Both sides of a rename, exactly as `changedPaths` does: a source file
+  // renamed into docs/ while its old path is deleted is a code change.
+  return files.flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
+}
+
+/**
+ * Every commit a push introduced, or a hard failure.
+ *
+ * The one place the compare endpoint is BETTER than its file list: it reports
+ * `total_commits`, so this list can be reconciled the way `changedPaths`
+ * reconciles against `changed_files` and the file half here cannot.
+ */
+export async function pushedCommits(before, after, ctx) {
+  const cmp = await pushComparison(before, after, ctx);
+  const declared = requireCount(cmp.total_commits, "commit", "comparison");
+  const commits = cmp.commits;
+  if (!Array.isArray(commits)) {
+    throw new PolicyError(
+      `The comparison reported no commit list — the prefix rule cannot be verified.`,
+    );
+  }
+  if (commits.length !== declared) {
+    throw new PolicyError(
+      `Commit list incomplete: listed ${commits.length} of ${declared} commits ` +
+        `(the API caps at 250) — the prefix rule cannot be verified.`,
+    );
+  }
+  return commits;
 }
 
 /** The open pull requests a commit currently heads. */
@@ -427,6 +532,22 @@ export function eventSnapshot(env, readFile = readFileSync) {
   }
   const pr = payload.pull_request || {};
   return {
+    // A push's own account of what it added. `before` is the branch tip the
+    // push moved off, so `before...after` is the range this push introduced --
+    // the only source for it, since a push carries no pull request to read a
+    // diff from. `forced` is GitHub's own flag for a rewrite; it is read as a
+    // fast refusal, never as the proof, which is the ancestry check in
+    // `pushedPaths` -- a payload field that quietly stopped being set would
+    // otherwise turn the guard off while looking configured.
+    before: payload.before ?? null,
+    // The push's own account of where it landed, kept rather than inferred
+    // from GITHUB_SHA. On a branch DELETION `after` is all zeros while
+    // Actions still sets GITHUB_SHA to the default branch's tip, so
+    // substituting it would compare `before...default-tip` -- a range this
+    // push never introduced, and one that compares `ahead` in the routine
+    // case of deleting a branch that was already merged.
+    after: payload.after ?? null,
+    forced: payload.forced === true,
     // Only `pull_request_target` binding reads this -- see `verifyPrBinding` --
     // but it comes from the same payload every other field here does, so it is
     // captured alongside them rather than read out separately.
@@ -951,8 +1072,48 @@ export async function publishResult(env, gateErr, appCreds, fetchImpl = fetch, s
 
 /** true when every changed path is documentation and the verdict is trustworthy. */
 export async function classify(env, policy, ctx) {
-  const { event, pr } = env;
-  if (event === "pull_request" || event === "pull_request_target") {
+  const { event, pr, sha, snapshot } = env;
+  let paths;
+  if (event === "push") {
+    // A push has no pull request, so none of the PR-shaped guards above apply
+    // and none of them are skipped either -- there is simply no claim to
+    // bind. What replaces them is `pushedPaths`' ancestry check: the range
+    // must be one this push actually added.
+    //
+    // Nothing gates this the way `gate` gates a pull request, because a push
+    // has no merge left to gate and no required check to satisfy. What a
+    // wrong answer costs here is a job that did not run, not a merge that was
+    // certified without one -- and the consumers reaching for this are
+    // replacing an `on: push: paths:` filter, which skips the entire run on a
+    // second copy of the same policy that nothing verifies at all.
+    if (policy.pushLane !== "classify") return false;
+    if (!snapshot) {
+      throw new PolicyError(
+        `A push cannot be classified without its event payload, which is where its range is recorded.`,
+      );
+    }
+    if (snapshot.forced) {
+      throw new PolicyError(
+        `This push is a force-push — its range describes commits it did not add, so it cannot be classified.`,
+      );
+    }
+    // GITHUB_SHA is only the pushed tip when the push actually landed one.
+    // Proven equal rather than assumed, and the all-zero case named on its
+    // own so a deletion reads as a deletion rather than as a mismatch.
+    if (!snapshot.after || /^0+$/.test(snapshot.after)) {
+      throw new PolicyError(
+        `This push reports no resulting tip (${JSON.stringify(snapshot.after)}) — a branch deletion ` +
+          `adds no commits, and the ref this run reports for is not the range's end.`,
+      );
+    }
+    if (snapshot.after !== sha) {
+      throw new PolicyError(
+        `This push landed ${snapshot.after} but this run reports for ${sha} — refusing to classify a ` +
+          `range whose end is not the commit the verdict would label.`,
+      );
+    }
+    paths = await pushedPaths(snapshot.before, sha, ctx);
+  } else if (event === "pull_request" || event === "pull_request_target") {
     if (!pr) return false;
     // A commit can head more than one open pull request (stacked branches),
     // and a check run is per-commit -- so a gate minted for this one's
@@ -967,7 +1128,7 @@ export async function classify(env, policy, ctx) {
     return false;
   }
 
-  const paths = await changedPaths(pr, ctx);
+  paths = paths ?? (await changedPaths(pr, ctx));
   // An empty diff is not a docs diff; refuse to vouch for it.
   if (paths.length === 0) return false;
   return paths.every((p) => isDocs(p, policy.rules));
@@ -1048,6 +1209,17 @@ export async function lintPrefixes(pr, policy, ctx, pin = null) {
         `(the API caps at 250) — the prefix rule cannot be verified.`,
     );
   }
+  lintSubjects(commits, policy);
+}
+
+/**
+ * Every subject on the docs lane carries one of the prefixes.
+ *
+ * Split out because a push has commits to lint too and no pull request to
+ * read them from. What does NOT apply there is the title half above: a push
+ * has no title, and no merge left for one to land as.
+ */
+export function lintSubjects(commits, policy) {
   const bad = [];
   for (const c of commits) {
     // Merge commits are exempt structurally, by parent count -- a commit whose
@@ -1130,6 +1302,31 @@ export function parseResults(raw) {
 }
 
 /** The verdict the ruleset requires. Throws to fail the check. */
+/**
+ * Settle a push's verdict, on either terminal path.
+ *
+ * A push has no pin -- no pull request, no base to have moved -- so there is
+ * nothing of `stillPinned`'s to repeat. What it does share with a PR-less
+ * dispatch is the claim that goes stale the same way, and it is the reason
+ * this exists: **a push's range is not a pull request's diff.**
+ *
+ * A push carrying one final documentation commit onto a branch has a
+ * docs-only range and can be perfectly, truthfully green about it -- while
+ * the pull request whose head that commit now is contains a complete diff
+ * full of untested code. A status and a check run are both per-commit, so
+ * that green satisfies the pull request's required check without its diff
+ * ever having been classified or bound. The same hazard on the pull request
+ * lane is why `classify` refuses a head shared by two open pull requests.
+ *
+ * The cost is real and accepted: an API call on a path every consumer takes
+ * on every push, and a refusal where a default branch's tip happens to head
+ * an open pull request. That refusal is correct -- it hands the commit back
+ * to the pull-request gate, which is the thing responsible for it.
+ */
+async function settlePush(env, ctx) {
+  await stillUnclaimed(env.sha, ctx);
+}
+
 export async function gate(env, policy, ctx, pin = null) {
   if (env.classifyResult !== "success") {
     throw new PolicyError(
@@ -1173,6 +1370,7 @@ export async function gate(env, policy, ctx, pin = null) {
     // separate reads. Settle before reporting, exactly as the skip path does:
     // a green verdict for a snapshot the pull request no longer shows is the
     // same failure as an unjustified skip, arrived at from the other side.
+    if (env.event === "push") return await settlePush(env, ctx);
     if (prLessDispatch) await stillUnclaimed(env.sha, ctx);
     else await stillPinned(env.pr, pin, policy, ctx);
     return;
@@ -1188,6 +1386,23 @@ export async function gate(env, policy, ctx, pin = null) {
     throw new PolicyError(
       `Heavy jobs were skipped but the diff could not be verified as docs-only — refusing the skip.`,
     );
+  }
+  // After the re-derivation, never before it: a push's skip is only as good
+  // as the reason for it, exactly like a pull request's.
+  //
+  // An earlier revision returned here on the reasoning that every subject in
+  // the range had already been linted on the pull request that merged it.
+  // That is an assumption about the CONSUMER's branch protection, not a
+  // property of anything here -- and this engine deliberately knows nothing
+  // about a repository beyond the policy it is handed. Where direct pushes to
+  // the default branch are permitted, an unprefixed docs-only push would have
+  // skipped the heavy jobs and passed the gate while breaking the policy's
+  // every-commit prefix rule. So the range's own subjects are linted, and the
+  // lookup fails closed: a commit list that cannot be reconciled against
+  // `total_commits` refuses rather than waving the skip through.
+  if (env.event === "push") {
+    lintSubjects(await pushedCommits(env.snapshot.before, env.sha, ctx), policy);
+    return await settlePush(env, ctx);
   }
   await lintPrefixes(env.pr, policy, ctx, pin);
   // After every read the verdict rests on, not before them.
