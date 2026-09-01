@@ -49,7 +49,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      # `@main`, not `./` -- see the header: the merged engine judges the
+      # `@main`, not `$/` -- see the header: the merged engine judges the
       # branch, never the branch's own copy of it.
       - uses: mikelward/lanes@main
         id: lane
@@ -78,10 +78,19 @@ jobs:
       # names) would otherwise first execute on consumers, after merging.
       # classify is the cheapest full pass through the manifest, and nothing
       # gates on this step's output -- only its exit status, which feeds
-      # this job's result, which the @main gate assesses. So `uses: ./` is
-      # safe here, and only here: the branch still cannot bless itself.
+      # this job's result, which the @main gate assesses. So running the
+      # branch's own copy is safe here, and only here: the branch still
+      # cannot bless itself.
+      #
+      # `$/` is GitHub's self-repository form, not the workspace-relative
+      # `./`: Actions resolves it to the running commit itself, so what
+      # loads is this pull request's own manifest as the repository holds
+      # it, not whatever the workspace happens to contain -- the same way a
+      # consumer's `mikelward/lanes@main` loads it. The checkout above is
+      # for the test step below, which this step no longer depends on.
+      # zizmor 1.30.0 flags the `./` form (self-repository), on purpose.
       - name: Run the branch's own action end to end
-        uses: ./
+        uses: $/
         with:
           mode: classify
           pr: ${{ github.event.pull_request.number }}

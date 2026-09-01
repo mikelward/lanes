@@ -115,23 +115,29 @@ describe("this repository's own lane", () => {
   };
 
   test("classify and the gate run the merged engine; only test runs the branch's copy", () => {
-    // In the lane jobs, `uses: ./` would let a pull request rewrite the
-    // engine and be judged by its own rewrite -- the self-blessing hole
-    // SPEC.md names. `@main` is deliberate for the same reason it is in
-    // every consumer: there is no release step, so main IS the release.
-    // Inside the test job the branch's own copy is the point -- the
-    // integration step loads the branch's manifest, and nothing gates on
-    // its output; its exit status feeds the test job's result, which the
-    // @main gate assesses.
+    // In the lane jobs, `uses: $/` (or the workspace-relative `./`) would
+    // let a pull request rewrite the engine and be judged by its own
+    // rewrite -- the self-blessing hole SPEC.md names. `@main` is
+    // deliberate for the same reason it is in every consumer: there is no
+    // release step, so main IS the release. Inside the test job the
+    // branch's own copy is the point -- the integration step loads the
+    // branch's manifest, and nothing gates on its output; its exit status
+    // feeds the test job's result, which the @main gate assesses. It takes
+    // GitHub's self-repository form, `$/`, which resolves to the running
+    // commit rather than to the workspace: the `./` form is what zizmor
+    // 1.30.0's self-repository audit rejects, so its return here would
+    // redden the required scan as well as reintroduce a dependency on
+    // whatever a prior step left checked out.
     const jobs = { classify: jobBlock("classify"), test: jobBlock("test"), lanes: jobBlock("lanes") };
     for (const [name, block] of Object.entries(jobs)) {
       assert.ok(block.length > 0, `the ${name} job block was found`);
     }
     for (const name of ["classify", "lanes"]) {
       assert.match(jobs[name], /uses: mikelward\/lanes@main/, `${name} runs the merged engine`);
-      assert.doesNotMatch(jobs[name], /uses: \.\//, `${name} must not run the branch's own copy`);
+      assert.doesNotMatch(jobs[name], /uses: [.$]\//, `${name} must not run the branch's own copy`);
     }
-    assert.match(jobs.test, /uses: \.\//, "the test job exercises the branch's own manifest");
+    assert.match(jobs.test, /uses: \$\//, "the test job exercises the branch's own manifest");
+    assert.doesNotMatch(jobs.test, /uses: \.\//, "the workspace-relative form is what zizmor rejects");
     assert.doesNotMatch(jobs.test, /uses: mikelward\/lanes@main/);
   });
 

@@ -36,8 +36,8 @@ one repository whose merge-gate recipe differed, which every piece of fleet
 tooling (repo-rules and its siblings) would have had to special-case
 forever; the standard with zero exceptions beat the standard with one.
 
-**The engine the lane's jobs run is `@main`, never `uses: ./`.** Done the
-obvious way, with `./`, a branch would be judged by its own copy of the
+**The engine the lane's jobs run is `@main`, never `uses: $/`.** Done the
+obvious way, with `$/`, a branch would be judged by its own copy of the
 engine: rewrite `isDocs` to return `true`, skip the suite, and `lanes`
 agrees, being the same rewritten engine. With `@main` the merged engine
 judges the branch, and a pull request cannot tamper with the gate that
@@ -45,11 +45,16 @@ judges it. The cost is that classify and gate exercise the *previous*
 commit's engine, not the one under review — acceptable, because the `test`
 job runs the branch's own code, and that is where the correctness
 protection lives. The branch's own *manifest* is exercised too, by the
-separable step the original decision described: a `uses: ./` classify run
+separable step the original decision described: a `uses: $/` classify run
 inside the `test` job, where it is safe because nothing gates on its
 output — its exit status feeds the test job's result, which the `@main`
 gate assesses. Without that step, a change to `action.yml`'s wiring would
-first be loaded by Actions on consumers, after merging.
+first be loaded by Actions on consumers, after merging. `$/` is GitHub's
+self-repository form rather than the workspace-relative `./`: Actions
+resolves it to the running commit, so the manifest it loads is the pull
+request's own as the repository holds it, independent of what any earlier
+step left in the workspace — and zizmor's `self-repository` audit (1.30.0)
+treats `./` as the finding it is.
 
 **The accepted failure mode: a broken `main` wedges its own fix.** If a
 merge breaks the engine badly enough that `mode: classify` or `mode: gate`
