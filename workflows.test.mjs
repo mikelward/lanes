@@ -62,8 +62,13 @@ describe("the codex-review workflow", () => {
     assert.doesNotMatch(on, /\bpull_request_review:/);
   });
 
-  test("keeps the backstop schedule hourly, off the hour", () => {
-    assert.match(workflow, /cron:\s*'23 \* \* \* \*'/);
+  test("keeps the backstop schedule four-hourly, off the hour", () => {
+    // Four-hourly, not hourly: the events carry the verdict (Codex edits its
+    // review summary comment in place as a review starts and finishes, and
+    // that edit is an `issue_comment` this workflow wakes on), so the cron is
+    // only the backstop for what no event reports. `:23` rather than `:00`
+    // dodges the stampede every scheduler sees on the hour.
+    assert.match(workflow, /cron:\s*'23 \*\/4 \* \* \*'/);
   });
 
   test("holds the loop envelope: one queued successor, bounded runner", () => {
