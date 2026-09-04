@@ -501,3 +501,71 @@
       requiring the CI gate, the `codex` status, conversation resolution
       and up-to-date branches, and the auto-merge setting enabled.
 
+## Reconcile the fleet with the documented docs-lane standard
+
+- [ ] Decide whether to bring the fleet back to the standard this
+      repository already documents, or to change the standard. Not a
+      missing decision -- a documented one the fleet has drifted from.
+
+      `README.md`'s "Writing your policy" is explicit: `docs *.md` plus
+      `docs docs/**/*.md` is "the standard, and it is deliberately narrow",
+      and `docs **/*.md` is "the tempting shorthand ... wider than it
+      looks", to be reached for "only with the trap below answered".
+
+      Eight of thirteen consumers use the shorthand anyway -- lanes, repo,
+      conf, scripts, vcs, unixtools, root, snoozemo. Five follow the
+      standard: mesh, clothescast, readmo, typelauncher, simmo. This
+      repository is among the eight, which is the part worth staring at:
+      the engine ships advice its own policy does not take.
+
+      Both directions cost something real, and the measurements exist:
+
+      - Complying costs subdirectory READMEs. Under the narrow pair a
+        README outside `docs/` lands on the CODE lane and runs the whole
+        suite for a prose edit: `functions/README.md` (clothescast),
+        `grafana/README.md` and `infra/cf-gateway/README.md` (readmo),
+        `play/README.md` (typelauncher). Four files, four full suites.
+      - The shorthand costs exactly what the README warns of -- a markdown
+        file a build or a test reads becomes documentation. It is not
+        hypothetical in this fleet: mesh keeps `crates/**` on the code lane
+        above its docs rules precisely because two test-fixture READMEs
+        live there, and this repository carries `code README.md` because
+        `workflows.test.mjs` parses the consumer template out of it. Both
+        are the shorthand's trap being answered by hand, one repository at
+        a time.
+
+      Note the two sides need OPPOSITE exceptions, which decides what any
+      migration actually writes. Under the narrow pair a README outside the
+      root and `docs/` matches no rule and is already code by default, so a
+      `code` line for it is a no-op; recovering the four above takes a
+      `docs` rule (`docs functions/**/*.md` and friends). Under the
+      shorthand everything is already docs, so protecting a build or test
+      input takes a `code` rule -- which is what mesh and this repository
+      actually carry.
+
+      So the question is whether "narrow default plus per-repo `docs`
+      exceptions" beats "shorthand default plus per-repo `code`
+      exceptions", given that both shapes have needed exceptions in
+      practice.
+
+      Two mechanical details for whoever settles it:
+
+      - The `docs/*.md` trap is already documented in that README section
+        (it does not cross `/`, so `docs/play-store/README.md` lands on the
+        code lane). Worth confirming no consumer has spelled it that way;
+        none does today.
+      - One pattern per line. `parsePolicy` joins the rest of the line into
+        a single glob (`rest.join(" ")`), so `docs *.md docs/**/*.md` is
+        ONE pattern rather than two: it matches neither `README.md` nor
+        `docs/README.md`, and the docs lane silently never fires for
+        either. Whitespace itself is not the fault -- `docs User
+        Guide/**/*.md` legitimately matches `User Guide/setup.md`, so a
+        parser that rejected whitespace outright would break any consumer
+        with spaces in its paths. The open question is narrower: should the
+        parser notice one pattern that reads as several globs run together,
+        and if so, on what signal?
+
+      Measured 2026-09-04 against each repository's tracked files through
+      this engine's own `parsePolicy` and `isDocs`. One current no-op:
+      readmo's `docs docs/**/*.md` matches nothing, because readmo has no
+      `docs/` directory -- harmless, and live the moment one appears.
