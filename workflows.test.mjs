@@ -195,6 +195,7 @@ describe("this repository's own lane", () => {
       assert.equal(hasPrefix(subject, policy.prefixes), false, `'${subject}' is not a docs subject`);
     }
     assert.equal(policy.dispatchWithoutPr.mode, "refuse");
+    assert.equal(policy.lintTitle, false, "title lint is off in this repo's own policy");
   });
 
   test("re-runs on retarget, and holds read-only permissions", () => {
