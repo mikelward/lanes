@@ -23,7 +23,15 @@ import {
   PolicyError,
   changedPaths,
   classify,
+  classifyGenerated,
   classifyOrCode,
+  appLogin,
+  ATTEST_CONTEXT,
+  pushedByTrusted,
+  isGenerated,
+  standingVerdict,
+  describeVerdict,
+  carriedBase,
   pushedPaths,
   gate,
   isDocs,
@@ -70,8 +78,19 @@ function stub({
   compareCommits,
   nCompareCommits,
   defaultBranchName = "main",
+  // The statuses on a commit, newest first -- what a carried verdict is read
+  // from. Absent means "no statuses at all", never a green one.
+  status,
+  // The App's own record, answered to its JWT: where the login a standing
+  // verdict's creator is checked against comes from.
+  appSlug = "lanes-app",
+  // The API's permission record for whoever pushed a generated-only range.
+  senderPermission = "admin",
 } = {}) {
   const routes = [
+    [/\/collaborators\/[^/]+\/permission$/, () => ({ permission: senderPermission })],
+    [/\/commits\/[^/]+\/statuses$/, () => status ?? []],
+    [/^\/app$/, () => ({ slug: appSlug })],
     [/\/pulls\/\d+\/files/, () => files],
     [/\/pulls\/\d+\/commits/, () => commits],
     [/\/commits\/[^/]+\/pulls/, () => pulls ?? [{ state: "open", head: { sha: headSha }, number: 1 }]],
@@ -123,7 +142,7 @@ function stub({
   };
 }
 
-const ctx = (opts) => ({ token: "t", repo: "example/repo", fetchImpl: stub(opts) });
+const ctx = (opts) => ({ token: "t", repo: "example/repo", fetchImpl: stub(opts), sign: () => Buffer.from("sig") });
 const named = (...paths) => paths.map((filename) => ({ filename }));
 const PR_ENV = { event: "pull_request", pr: "1", ref: "refs/pull/1/merge", sha: "headsha" };
 // pull_request_target's GITHUB_REF is the base branch, not refs/pull/<pr>/... --
@@ -1128,7 +1147,7 @@ describe("a classification that cannot be established", () => {
       await classifyOrCode(() => classify(forced, PUSH_POLICY, ctx({})), (m) => said.push(m)),
       false,
     );
-    assert.match(said.join(""), /::warning::Could not establish a docs-only diff/);
+    assert.match(said.join(""), /::warning::Could not establish a docs-only or generated-only diff/);
     // Not a blanket false: the same wrapper still answers true for a range it
     // can establish, so the fallback is the failure path and not the only one.
     assert.equal(
@@ -1232,7 +1251,7 @@ describe("the entry point", () => {
     assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
     // Exiting 0 proves nothing on its own -- an entry point that never ran
     // exits 0 too. The output is what proves it ran.
-    assert.equal(r.output, "docs_only=false\nbase_sha=\n");
+    assert.equal(r.output, "docs_only=false\ngenerated_only=false\nbase_sha=\n");
   });
 
   test("the whole classify path falls back to code, policy read included", () => {
@@ -1242,7 +1261,7 @@ describe("the entry point", () => {
     // run, and the gate is where that failure turns the check red.
     const r = runEntry({ INPUT_MODE: "classify", GITHUB_EVENT_NAME: "push" });
     assert.equal(r.status, 0, `${r.stdout}${r.stderr}`);
-    assert.equal(r.output, "docs_only=false\nbase_sha=\n");
+    assert.equal(r.output, "docs_only=false\ngenerated_only=false\nbase_sha=\n");
     assert.match(r.stdout, /::warning::.*No lanes policy.*code lane/);
   });
 
@@ -1254,7 +1273,7 @@ describe("the entry point", () => {
     const env = { INPUT_PR: "1", GITHUB_EVENT_NAME: "pull_request", policy: "docs *.md\nprefixes docs\n" };
     const classified = runEntry({ ...env, INPUT_MODE: "classify" });
     assert.equal(classified.status, 0, `${classified.stdout}${classified.stderr}`);
-    assert.equal(classified.output, "docs_only=false\nbase_sha=\n");
+    assert.equal(classified.output, "docs_only=false\ngenerated_only=false\nbase_sha=\n");
     const gated = runEntry({ ...env, INPUT_MODE: "gate", "INPUT_CLASSIFY-RESULT": "success", INPUT_RESULTS: "check=skipped" });
     assert.notEqual(gated.status, 0, `expected a refusal, got: ${gated.stdout}${gated.stderr}`);
     assert.match(gated.stdout, /::error::.*must not label another's commit/);
@@ -1291,6 +1310,21 @@ describe("the entry point", () => {
     assert.match(misspelled.stdout, /::error::.*classify did not succeed/);
   });
 
+  test("attest mode without the App credential is refused, not published ambiently", () => {
+    // An attestation is read back only when the App posted it, so one this
+    // run could not post as the App is refused before anything is read --
+    // the message names the wiring, and the exit is non-zero.
+    const r = runEntry({
+      INPUT_MODE: "attest",
+      GITHUB_EVENT_NAME: "push",
+      policy: "docs *.md\nprefixes docs\n",
+      "INPUT_CLASSIFY-RESULT": "success",
+      INPUT_RESULTS: "check=success",
+    });
+    assert.notEqual(r.status, 0, `expected a refusal, got: ${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /::error::.*attest mode publishes the lanes-attest status as the App/);
+  });
+
   test("an unknown mode is an error, not a code-lane fallback", () => {
     // Otherwise a typo'd mode takes the classify path's shrug and exits 0
     // having done nothing -- a job that looks like it classified.
@@ -1318,6 +1352,7 @@ describe("the event snapshot", () => {
     const path = write({
       pull_request: { number: 7, head: { sha: "abc" }, base: { ref: "topic", sha: "def" } },
       repository: { default_branch: "main" },
+      sender: { login: "pusher" },
     });
     assert.deepEqual(eventSnapshot({ GITHUB_EVENT_PATH: path }), {
       before: null,
@@ -1327,6 +1362,7 @@ describe("the event snapshot", () => {
       head: "abc",
       baseRef: "topic",
       baseSha: "def",
+      sender: "pusher",
     });
   });
 
@@ -1338,7 +1374,7 @@ describe("the event snapshot", () => {
     assert.equal(snap.forced, false);
     // The PR fields are absent rather than invented, so a push cannot borrow
     // a pull request's binding.
-    assert.deepEqual([snap.number, snap.head, snap.baseRef, snap.baseSha], [null, null, null, null]);
+    assert.deepEqual([snap.number, snap.head, snap.baseRef, snap.baseSha, snap.sender], [null, null, null, null, null]);
   });
 
   test("a force-push says so", () => {
@@ -1881,6 +1917,32 @@ describe("gate mode: publishing the terminal result", () => {
     assert.equal(body.state, "success");
   });
 
+  test("the verdict's own description is what gets published", async () => {
+    // The description is read back by a later generated-only head
+    // (`standingVerdict`), so what is posted has to be what `describeVerdict`
+    // wrote -- base marker included -- and not a fixed sentence.
+    const { fetchImpl, calls } = appFetchStub();
+    const verdict = { lane: "code", baseSha: "basesha" };
+    await publishResult(env, null, { appId: "1", privateKey: "k" }, fetchImpl, stubSign, verdict);
+    const body = JSON.parse(calls.find((c) => c.path.includes("/statuses/")).body);
+    assert.equal(body.state, "success");
+    assert.equal(body.description, describeVerdict(verdict));
+    assert.equal(carriedBase(body.description), "basesha");
+  });
+
+  test("attest mode publishes under its own context, and only as the App", async () => {
+    const { fetchImpl, calls } = appFetchStub();
+    const verdict = { lane: "code", baseSha: "basesha" };
+    await publishResult(env, null, { appId: "1", privateKey: "k" }, fetchImpl, stubSign, verdict, ATTEST_CONTEXT);
+    const body = JSON.parse(calls.find((c) => c.path.includes("/statuses/")).body);
+    assert.equal(body.context, "lanes-attest");
+    assert.equal(carriedBase(body.description), "basesha");
+    // The default is the required context, unchanged for every gate caller.
+    const plain = appFetchStub();
+    await publishResult(env, null, { appId: "1", privateKey: "k" }, plain.fetchImpl, stubSign, verdict);
+    assert.equal(JSON.parse(plain.calls.find((c) => c.path.includes("/statuses/")).body).context, "lanes");
+  });
+
   test("a gate error posts failure and is still re-thrown -- the status is additional, not instead", async () => {
     const { fetchImpl, calls } = appFetchStub();
     const err = new PolicyError("heavy jobs did not all succeed");
@@ -1909,5 +1971,394 @@ describe("gate mode: publishing the terminal result", () => {
       publishResult(env, null, { appId: "1", privateKey: "k" }, fetchImpl, stubSign),
       /is it installed there/,
     );
+  });
+});
+
+describe("the generated lane", () => {
+  // A workflow writing its own output back onto the branch -- a screenshot
+  // job committing the baselines it re-recorded -- starts a fresh run whose
+  // heavy jobs redo, on a head differing only by those files, everything the
+  // previous head's run just did. The pull request's DIFF is code, so the
+  // docs lane cannot cover it; this lane asks whether the PUSH was inert on
+  // top of a head already vouched for, and carries that verdict forward.
+  const GEN_POLICY = parsePolicy(`
+code app/src/test/snapshots/README.md
+generated app/src/test/snapshots/images/**
+code app/**
+docs *.md
+prefixes ci docs
+`);
+  // A synchronize: the payload carries the range it pushed, and the head and
+  // base the event was raised for.
+  const CREDS = { appId: "1", privateKey: "k" };
+  const sync = (over = {}) => ({
+    ...PR_ENV,
+    appCreds: CREDS,
+    snapshot: {
+      before: "prevhead",
+      after: "headsha",
+      forced: false,
+      number: 1,
+      head: "headsha",
+      baseRef: "main",
+      baseSha: "basetip",
+      sender: "owner",
+      ...over,
+    },
+  });
+  const APP = { login: "lanes-app[bot]", type: "Bot" };
+  const green = (description = "Every required job passed. [base basetip]", state = "success", creator = APP) => [
+    { context: "lanes", state, description, creator },
+  ];
+  const genCtx = (over = {}) =>
+    ctx({
+      // The pull request's own diff is code -- that is the whole point.
+      files: named("app/src/main/Main.kt", "app/src/test/snapshots/images/home.png"),
+      compareFiles: named("app/src/test/snapshots/images/home.png"),
+      compareCommits: [{ commit: { message: "ci: refresh recorded screenshots" }, parents: [{}] }],
+      status: green(),
+      ...over,
+    });
+
+  test("the policy takes a generated rule, ordered with the rest", () => {
+    assert.deepEqual(GEN_POLICY.rules[1], { verdict: "generated", pattern: "app/src/test/snapshots/images/**" });
+    assert.throws(() => parsePolicy("generated\nprefixes docs\n"), /needs a pattern/);
+    // First match wins in both directions: a code rule above excludes, and
+    // the generated rule shadows the app/** code rule below it.
+    assert.equal(isGenerated("app/src/test/snapshots/images/home.png", GEN_POLICY.rules), true);
+    assert.equal(isGenerated("app/src/test/snapshots/images/deep/a.png", GEN_POLICY.rules), true);
+    assert.equal(isGenerated("app/src/test/snapshots/README.md", GEN_POLICY.rules), false);
+    assert.equal(isGenerated("app/src/main/Main.kt", GEN_POLICY.rules), false);
+    // The two lanes never answer for each other, and the policy file is
+    // code under both whatever the rules say.
+    assert.equal(isDocs("app/src/test/snapshots/images/home.png", GEN_POLICY.rules), false);
+    assert.equal(isGenerated("README.md", GEN_POLICY.rules), false);
+    assert.equal(isGenerated(POLICY_PATH, parsePolicy("generated **\nprefixes docs\n").rules), false);
+  });
+
+  test("a synchronize that added only generated files to a vouched-for head carries", async () => {
+    assert.equal(await classifyGenerated(sync(), GEN_POLICY, genCtx()), true);
+    // And the docs lane still says no to the same pull request: its diff is
+    // code, and that is what makes this lane necessary rather than redundant.
+    assert.equal(await classify(sync(), GEN_POLICY, genCtx()), false);
+  });
+
+  test("a policy without a generated rule opts out before any read", async () => {
+    const broken = { token: "t", repo: "example/repo", fetchImpl: async () => { throw new Error("read"); } };
+    assert.equal(await classifyGenerated(sync(), POLICY, broken), false);
+  });
+
+  test("only a synchronize on a pull request has a range to carry across", async () => {
+    // opened / reopened / edited carry no before, and a push or a dispatch is
+    // not a pull request event at all.
+    assert.equal(await classifyGenerated({ ...PR_ENV, snapshot: { ...sync().snapshot, before: null } }, GEN_POLICY, genCtx()), false);
+    assert.equal(await classifyGenerated(sync({ before: "0".repeat(40) }), GEN_POLICY, genCtx()), false);
+    assert.equal(await classifyGenerated({ ...sync(), event: "push" }, GEN_POLICY, genCtx()), false);
+    assert.equal(await classifyGenerated({ ...sync(), event: "workflow_dispatch" }, GEN_POLICY, genCtx()), false);
+    assert.equal(await classifyGenerated({ ...sync(), pr: "" }, GEN_POLICY, genCtx()), false);
+    // pull_request_target takes the same path: the payload is the same.
+    assert.equal(
+      await classifyGenerated({ ...sync(), event: "pull_request_target", ref: "refs/heads/main" }, GEN_POLICY, genCtx()),
+      true,
+    );
+  });
+
+  test("a range that is not all generated is code, and so is an empty one", async () => {
+    assert.equal(
+      await classifyGenerated(sync(), GEN_POLICY, genCtx({ compareFiles: named("app/src/test/snapshots/images/home.png", "app/src/main/Main.kt") })),
+      false,
+    );
+    // A rename out of code is judged on both sides, as everywhere.
+    const renamed = [{ filename: "app/src/test/snapshots/images/a.png", previous_filename: "app/src/main/Main.kt" }];
+    assert.equal(await classifyGenerated(sync(), GEN_POLICY, genCtx({ compareFiles: renamed })), false);
+    assert.equal(await classifyGenerated(sync(), GEN_POLICY, genCtx({ compareFiles: [] })), false);
+    // Docs are not generated: a markdown-only synchronize takes the docs
+    // question, not this one.
+    assert.equal(await classifyGenerated(sync(), GEN_POLICY, genCtx({ compareFiles: named("README.md") })), false);
+  });
+
+  test("the range must be the push the event describes", async () => {
+    // A force-push's range leads nowhere; the comparison says so.
+    await assert.rejects(classifyGenerated(sync(), GEN_POLICY, genCtx({ compare: "diverged" })), /rewritten history/);
+    // The payload's after is the head it names, or the range ends elsewhere.
+    await assert.rejects(classifyGenerated(sync({ after: "elsewhere" }), GEN_POLICY, genCtx()), /does not end at the commit/);
+    // A head that moved since the event belongs to the replacement's run.
+    await assert.rejects(classifyGenerated(sync(), GEN_POLICY, genCtx({ headSha: "newer" })), /head moved/);
+    // No base in the payload means nothing to match the carried verdict to.
+    await assert.rejects(classifyGenerated(sync({ baseSha: null }), GEN_POLICY, genCtx()), /names no base commit/);
+  });
+
+  test("a pull request that edits the policy never carries", async () => {
+    // The rules judging the range come from the pull request's own merge
+    // ref, and only the range is judged -- so a pull request could add
+    // `generated src/**`, earn a legitimate green on that head, then push
+    // source alone and have it carried (Codex on PR #28). Refused outright
+    // while the policy is under review, on either side of a rename and in
+    // any spelling, exactly as the policy file is always code for `isDocs`.
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ files: named("app/src/main/Main.kt", POLICY_PATH) })),
+      /changes \.github\/lanes\.conf — a verdict is never carried across rules still under review/,
+    );
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ files: named("app/src/main/Main.kt", ".github/LANES.conf") })),
+      /never carried across rules/,
+    );
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ files: [{ filename: "lanes.conf.old", previous_filename: POLICY_PATH }] })),
+      /never carried across rules/,
+    );
+    // A truncated file list refuses too, never reads as "policy untouched".
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ changed: 3000 })),
+      /File list incomplete/,
+    );
+  });
+
+  test("only an administrator's push, or the App's own, carries", async () => {
+    // The files a generated rule names are the ones CI writes back, and on
+    // the code lane CI overwrites whatever was hand-pushed there. The carry
+    // skips exactly that correction, so a collaborator or a fork contributor
+    // pushing hand-made files under a generated path would otherwise ride an
+    // attested head to the default branch (Codex on typelauncher#721).
+    for (const permission of ["write", "read", "none", "maintain", "triage"]) {
+      await assert.rejects(
+        classifyGenerated(sync({ sender: "someone" }), GEN_POLICY, genCtx({ senderPermission: permission })),
+        /made by "someone", whose permission here is .* — only an administrator's push/,
+      );
+    }
+    assert.equal(await classifyGenerated(sync({ sender: "owner" }), GEN_POLICY, genCtx({ senderPermission: "admin" })), true);
+    // The App's own push needs no record -- and reads none, so a stub that
+    // would refuse everyone still lets it through.
+    assert.equal(
+      await classifyGenerated(sync({ sender: "lanes-app[bot]" }), GEN_POLICY, genCtx({ senderPermission: "none" })),
+      true,
+    );
+    // No sender is refused, never read as trusted.
+    await assert.rejects(classifyGenerated(sync({ sender: null }), GEN_POLICY, genCtx()), /names no sender/);
+    await assert.rejects(pushedByTrusted(undefined, "lanes-app[bot]", genCtx()), /names no sender/);
+    // The lookup is by the exact login, encoded.
+    const seen = [];
+    const spy = { ...genCtx(), fetchImpl: async (url, opts) => { seen.push(new URL(url).pathname); return genCtx().fetchImpl(url, opts); } };
+    await pushedByTrusted("a b", "lanes-app[bot]", spy);
+    assert.ok(seen.some((p) => p.endsWith("/collaborators/a%20b/permission")), seen.join(" "));
+  });
+
+  test("a shared head never carries", async () => {
+    const shared = [
+      { state: "open", head: { sha: "headsha" }, number: 1 },
+      { state: "open", head: { sha: "headsha" }, number: 2 },
+    ];
+    assert.equal(await classifyGenerated(sync(), GEN_POLICY, genCtx({ pulls: shared })), false);
+  });
+
+  test("only a green the trusted App itself posted carries", async () => {
+    // Any workflow with statuses:write can post a `lanes` status under the
+    // right context carrying `success` and a forged base marker, then push
+    // generated files onto it (Codex on PR #28). The creator is checked
+    // against the login the App's own credential resolves to.
+    const forged = { login: "github-actions[bot]", type: "Bot" };
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ status: green(undefined, "success", forged) })),
+      /posted by "github-actions\[bot\]", not by the App \(lanes-app\[bot\]\)/,
+    );
+    // A user account under the App's login shape is not the App either.
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ status: green(undefined, "success", { login: "lanes-app[bot]", type: "User" }) })),
+      /not by the App/,
+    );
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ status: green(undefined, "success", null) })),
+      /not by the App/,
+    );
+    // The expected login follows the credential, not a fixed name.
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ appSlug: "other-app" })),
+      /not by the App \(other-app\[bot\]\)/,
+    );
+    // And without a credential there is nothing to check against, so a run
+    // that was handed none never carries -- refused by name, before any read
+    // of the range, so the warning says what to wire.
+    const broken = { token: "t", repo: "example/repo", fetchImpl: async () => { throw new Error("read"); } };
+    await assert.rejects(classifyGenerated({ ...sync(), appCreds: {} }, GEN_POLICY, broken), /holds no App credential/);
+    await assert.rejects(classifyGenerated({ ...sync(), appCreds: undefined }, GEN_POLICY, broken), /holds no App credential/);
+    await assert.rejects(standingVerdict("prevhead", genCtx(), ""), /no App login was established/);
+  });
+
+  test("appLogin resolves the App's own bot login from its credential", async () => {
+    assert.equal(await appLogin(CREDS, genCtx().fetchImpl, () => Buffer.from("sig")), "lanes-app[bot]");
+    const denied = async () => ({ ok: false, status: 401, json: async () => ({}) });
+    await assert.rejects(appLogin(CREDS, denied, () => Buffer.from("sig")), /App's own identity \(GitHub API 401\)/);
+    const nameless = async () => ({ ok: true, status: 200, json: async () => ({}) });
+    await assert.rejects(appLogin(CREDS, nameless, () => Buffer.from("sig")), /names no slug/);
+  });
+
+  test("only an App-published green that names this event's base carries", async () => {
+    // Nothing standing on the previous head: the ambient check-run is not
+    // read, so a consumer without trusted publishing is code here, always.
+    await assert.rejects(classifyGenerated(sync(), GEN_POLICY, genCtx({ status: undefined })), /no published lanes status/);
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ status: [{ context: "ci", state: "success", creator: APP }] })),
+      /no published lanes status/,
+    );
+    // Red, or still pending, does not carry.
+    await assert.rejects(classifyGenerated(sync(), GEN_POLICY, genCtx({ status: green("x", "failure") })), /'failure', not success/);
+    await assert.rejects(classifyGenerated(sync(), GEN_POLICY, genCtx({ status: green("x", "pending") })), /'pending', not success/);
+    // A green that names no base -- a docs-only skip, a push's verdict, a
+    // PR-less dispatch -- vouched for no merge snapshot.
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ status: green("Documentation-only diff; the heavy jobs were skipped.") })),
+      /names no base/,
+    );
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ status: green("Every required job passed.") })),
+      /names no base/,
+    );
+    // A green measured against a base this event no longer has: the heavy
+    // jobs never saw merge(after, base-now).
+    await assert.rejects(
+      classifyGenerated(sync(), GEN_POLICY, genCtx({ status: green("Every required job passed. [base older]") })),
+      /measured against base older, but this event's base is basetip/,
+    );
+    // A carried verdict carries again, since it names the base it inherited.
+    assert.equal(
+      await classifyGenerated(
+        sync(),
+        GEN_POLICY,
+        genCtx({ status: green("Generated-only push; verdict carried forward from abc1234. [base basetip]") }),
+      ),
+      true,
+    );
+  });
+
+  test("the description is the contract, in both directions", () => {
+    // A green on a pull request names its base; a docs skip, a push and a
+    // PR-less dispatch name none -- and reading them back agrees.
+    const code = describeVerdict({ lane: "code", baseSha: "basetip" });
+    assert.equal(carriedBase(code), "basetip");
+    assert.equal(carriedBase(describeVerdict({ lane: "code" })), null);
+    assert.equal(carriedBase(describeVerdict({ lane: "docs" })), null);
+    assert.equal(carriedBase(describeVerdict(null)), null);
+    const carried = describeVerdict({ lane: "generated", carriedFrom: "prevhead0123456", baseSha: "basetip" });
+    assert.match(carried, /carried forward from prevhea\b/);
+    assert.equal(carriedBase(carried), "basetip");
+    // Every description fits the Statuses API's 140-character cap with a
+    // full-length sha, or the marker would be truncated off the end and the
+    // verdict silently stop carrying.
+    const sha = "f".repeat(40);
+    for (const v of [{ lane: "code", baseSha: sha }, { lane: "generated", carriedFrom: sha, baseSha: sha }]) {
+      assert.ok(describeVerdict(v).length <= 140, describeVerdict(v));
+    }
+    assert.equal(carriedBase("garbage [base ]"), null);
+    assert.equal(carriedBase(undefined), null);
+  });
+
+  test("standingVerdict reads the newest lanes status, across every page", async () => {
+    assert.deepEqual(await standingVerdict("prevhead", genCtx(), "lanes-app[bot]"), { sha: "prevhead", baseSha: "basetip" });
+    // The list is newest first, so the entry that stands is the first
+    // `lanes` one -- a green superseded by a later pending does not carry,
+    // and a forgery posted after the real green shadows it.
+    const superseded = [{ context: "lanes", state: "pending", creator: APP }, ...green()];
+    await assert.rejects(standingVerdict("prevhead", genCtx({ status: superseded }), "lanes-app[bot]"), /'pending', not success/);
+    const shadowed = [{ context: "lanes", state: "success", description: "Every required job passed. [base basetip]", creator: { login: "github-actions[bot]", type: "Bot" } }, ...green()];
+    await assert.rejects(standingVerdict("prevhead", genCtx({ status: shadowed }), "lanes-app[bot]"), /not by the App/);
+    // The attestation speaks for the heavy jobs where it stands: a `lanes`
+    // still pending -- the push's own run canceled the job that would have
+    // published it -- does not hide a green `lanes-attest`, and a red
+    // attestation is not rescued by a green `lanes` beside it.
+    const attested = [{ context: "lanes", state: "pending", creator: APP }, { ...green()[0], context: ATTEST_CONTEXT }];
+    assert.deepEqual(await standingVerdict("prevhead", genCtx({ status: attested }), "lanes-app[bot]"), { sha: "prevhead", baseSha: "basetip" });
+    const redAttest = [{ context: ATTEST_CONTEXT, state: "failure", creator: APP }, ...green()];
+    await assert.rejects(standingVerdict("prevhead", genCtx({ status: redAttest }), "lanes-app[bot]"), /'failure', not success/);
+    // And the attestation is held to the same creator check.
+    const forgedAttest = [{ ...green()[0], context: ATTEST_CONTEXT, creator: { login: "github-actions[bot]", type: "Bot" } }, ...green()];
+    await assert.rejects(standingVerdict("prevhead", genCtx({ status: forgedAttest }), "lanes-app[bot]"), /not by the App/);
+    // Other contexts ahead of it are skipped, however many; and the list is
+    // read through `api()`, which follows the page links, so `lanes` on a
+    // later page is found (Codex on PR #28) -- the pages are stitched by
+    // the stub's Link header below.
+    const noise = Array.from({ length: 150 }, (_, i) => ({ context: `ci-${i}`, state: "success", creator: APP }));
+    const pages = [noise.slice(0, 100), [...noise.slice(100), ...green()]];
+    const paged = {
+      token: "t",
+      repo: "example/repo",
+      sign: () => Buffer.from("sig"),
+      fetchImpl: async (url) => {
+        const u = new URL(url);
+        assert.match(u.pathname, /\/commits\/prevhead\/statuses$/);
+        const page = Number(u.searchParams.get("page") || "1");
+        const next = page < pages.length ? `<${u.origin}${u.pathname}?per_page=100&page=${page + 1}>; rel="next"` : "";
+        return { ok: true, status: 200, json: async () => pages[page - 1], headers: { get: (h) => (h === "link" ? next : "") } };
+      },
+    };
+    assert.deepEqual(await standingVerdict("prevhead", paged, "lanes-app[bot]"), { sha: "prevhead", baseSha: "basetip" });
+  });
+
+  describe("gate", () => {
+    const skipped = { ...sync(), classifyResult: "success", results: "build=skipped shots=skipped" };
+    const pin = { head: "headsha", baseRef: "main", baseSha: "basetip", title: null };
+
+    test("a generated-only skip passes, lints the pushed subjects, and reports what it carried", async () => {
+      const verdict = await gate(skipped, GEN_POLICY, genCtx(), pin);
+      assert.deepEqual(verdict, { lane: "generated", carriedFrom: "prevhead", baseSha: "basetip" });
+      // The published description then names the base again, so the NEXT
+      // generated push can carry this verdict in turn.
+      assert.equal(carriedBase(describeVerdict(verdict)), "basetip");
+      // The pushed commit is housekeeping by construction and carries a
+      // prefix like any skip-lane subject; the pull request's TITLE is not
+      // linted, since it describes the code the pull request is.
+      await assert.rejects(
+        gate(skipped, GEN_POLICY, genCtx({ compareCommits: [{ commit: { message: "Refresh screenshots" }, parents: [{}] }] }), pin),
+        /commit subject lacks a prefix: 'Refresh screenshots'/,
+      );
+      await gate(skipped, GEN_POLICY, genCtx({ title: "Add a settings screen" }), pin);
+    });
+
+    test("a skip that is neither docs nor generated is refused, naming both", async () => {
+      await assert.rejects(
+        gate(skipped, GEN_POLICY, genCtx({ compareFiles: named("app/src/main/Main.kt") }), pin),
+        /could not be verified as docs-only or generated-only/,
+      );
+      // And the reason a carry could not be established is the gate's error,
+      // not a bare refusal.
+      await assert.rejects(gate(skipped, GEN_POLICY, genCtx({ status: undefined }), pin), /no published lanes status/);
+    });
+
+    test("a carried verdict settles against the event's base like any other", async () => {
+      // The base moved between the reads: the carried verdict named basetip,
+      // this event named basetip, and the tip is something else now.
+      await assert.rejects(gate(skipped, GEN_POLICY, genCtx({ tip: "advanced" }), pin), /base branch moved/);
+    });
+
+    test("a push never carries; it has no head to carry from", async () => {
+      const pushSkip = {
+        event: "push",
+        pr: "",
+        sha: "newtip",
+        snapshot: { before: "oldtip", after: "newtip", forced: false },
+        classifyResult: "success",
+        results: "build=skipped",
+      };
+      const pushPolicy = parsePolicy("generated images/**\ndocs *.md\nprefixes ci docs\npush classify\n");
+      await assert.rejects(
+        gate(pushSkip, pushPolicy, ctx({ compareFiles: named("images/a.png"), compareCommits: [{ commit: { message: "ci: a" }, parents: [{}] }], pulls: [], status: green() })),
+        /could not be verified as docs-only or generated-only/,
+      );
+    });
+
+    test("every other terminal verdict names its lane, and only a green on a pull request names a base", async () => {
+      const greenPr = { ...PR_ENV, classifyResult: "success", results: "check=success" };
+      assert.deepEqual(await gate(greenPr, POLICY, ctx({ files: named("src/a.rs") }), pin), { lane: "code", baseSha: "basetip" });
+      const docsSkip = { ...PR_ENV, classifyResult: "success", results: "check=skipped" };
+      assert.deepEqual(
+        await gate(docsSkip, POLICY, ctx({ files: named("README.md"), commits: [{ parents: [{}], commit: { message: "docs: x" } }] }), pin),
+        { lane: "docs" },
+      );
+      const pushEnv = { event: "push", pr: "", sha: "newtip", snapshot: { before: "oldtip", after: "newtip", forced: false }, classifyResult: "success" };
+      assert.deepEqual(await gate({ ...pushEnv, results: "check=success" }, PUSH_POLICY, ctx({ pulls: [] })), { lane: "code" });
+      assert.deepEqual(
+        await gate({ ...pushEnv, results: "check=skipped" }, PUSH_POLICY, ctx({ compareFiles: named("README.md"), compareCommits: [{ commit: { message: "docs: a" }, parents: [{}] }], pulls: [] })),
+        { lane: "docs" },
+      );
+    });
   });
 });

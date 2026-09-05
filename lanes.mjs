@@ -121,6 +121,7 @@ export function parsePolicy(text) {
     switch (directive) {
       case "docs":
       case "code":
+      case "generated":
         if (!argument) {
           throw new PolicyError(`${POLICY_PATH}:${lineno}: '${directive}' needs a pattern.`);
         }
@@ -250,6 +251,25 @@ export function isDocs(path, rules) {
   if (path.toLowerCase() === POLICY_PATH) return false;
   for (const { verdict, pattern } of rules) {
     if (matchesGlob(path, pattern)) return verdict === "docs";
+  }
+  return false;
+}
+
+/**
+ * Is this path a generated file -- one a workflow writes back onto the
+ * branch, judged by the policy's `generated` rules?
+ *
+ * The same first-match-wins walk over the same ordered list as `isDocs`, so
+ * a `code` rule placed above a `generated` one excludes exactly as it does
+ * for docs, and the policy file is code here too. A generated path is not a
+ * docs path and a docs path is not a generated one: the two lanes ask
+ * different questions (see `classifyGenerated`), and a rule answers only the
+ * one it was written for.
+ */
+export function isGenerated(path, rules) {
+  if (path.toLowerCase() === POLICY_PATH) return false;
+  for (const { verdict, pattern } of rules) {
+    if (matchesGlob(path, pattern)) return verdict === "generated";
   }
   return false;
 }
@@ -555,6 +575,10 @@ export function eventSnapshot(env, readFile = readFileSync) {
     head: pr.head ? pr.head.sha : null,
     baseRef: pr.base ? pr.base.ref : null,
     baseSha: pr.base ? pr.base.sha : null,
+    // Who pushed. Read by the generated lane only: a carry is a claim about
+    // where the pushed files came from, and the event's own account of the
+    // pusher is the one fact about that a checkout cannot forge.
+    sender: payload.sender && payload.sender.login ? payload.sender.login : null,
   };
 }
 
@@ -989,7 +1013,11 @@ function runUrl(env) {
 }
 
 /** Post the `lanes` commit status directly, authenticated as the App. */
-export async function publishStatus({ repo, sha, state, description, targetUrl }, token, fetchImpl = fetch) {
+export async function publishStatus(
+  { repo, sha, state, description, targetUrl, context = REQUIRED_CONTEXT },
+  token,
+  fetchImpl = fetch,
+) {
   const res = await fetchImpl(`https://api.github.com/repos/${repo}/statuses/${sha}`, {
     method: "POST",
     headers: {
@@ -999,13 +1027,13 @@ export async function publishStatus({ repo, sha, state, description, targetUrl }
     },
     body: JSON.stringify({
       state,
-      context: "lanes",
+      context,
       description: description ? description.slice(0, DESCRIPTION_LIMIT) : undefined,
       target_url: targetUrl,
     }),
   });
   if (!res.ok) {
-    throw new PolicyError(`Could not post the lanes status (${res.status}) onto ${sha}.`);
+    throw new PolicyError(`Could not post the ${context} status (${res.status}) onto ${sha}.`);
   }
 }
 
@@ -1039,7 +1067,15 @@ export async function publishPending(env, appCreds, fetchImpl = fetch, sign = de
  * either: it is at least as urgent as `gate`'s own verdict, since it means
  * the required check may not have received a terminal value at all.
  */
-export async function publishResult(env, gateErr, appCreds, fetchImpl = fetch, sign = defaultSign) {
+export async function publishResult(
+  env,
+  gateErr,
+  appCreds,
+  fetchImpl = fetch,
+  sign = defaultSign,
+  verdict = null,
+  context = REQUIRED_CONTEXT,
+) {
   const repo = env.GITHUB_REPOSITORY;
   const sha = statusSha({ event: env.GITHUB_EVENT_NAME, snapshot: eventSnapshot(env), sha: env.GITHUB_SHA });
   let publishErr = null;
@@ -1050,8 +1086,9 @@ export async function publishResult(env, gateErr, appCreds, fetchImpl = fetch, s
         repo,
         sha,
         state: gateErr ? "failure" : "success",
-        description: gateErr ? gateErr.message : "Every required job passed.",
+        description: gateErr ? gateErr.message : describeVerdict(verdict),
         targetUrl: runUrl(env),
+        context,
       },
       token,
       fetchImpl,
@@ -1066,6 +1103,194 @@ export async function publishResult(env, gateErr, appCreds, fetchImpl = fetch, s
   }
   if (publishErr) throw publishErr;
   if (gateErr) throw gateErr;
+}
+
+// --- Carrying a verdict ------------------------------------------------------
+
+/**
+ * The status context a ruleset requires, and the one a verdict is carried
+ * from when nothing better stands.
+ */
+export const REQUIRED_CONTEXT = "lanes";
+
+/**
+ * The context `attest` mode publishes: the heavy jobs' verdict on a head,
+ * posted BEFORE any job that pushes generated files onto it, so the next
+ * head has something to carry -- while `lanes` itself stays pending until
+ * everything, the push included, is done. Two contexts because the two
+ * questions come apart exactly there: "did the heavy jobs pass" is what a
+ * later head inherits, and "may this head merge" must wait for the push
+ * that changes what the head is. A consumer with no such job needs no
+ * attestation; the carry falls back to `lanes`.
+ */
+export const ATTEST_CONTEXT = "lanes-attest";
+
+/**
+ * The terminal status's description ends, for a verdict that vouches for a
+ * merge snapshot, with the base commit that snapshot was measured against --
+ * `[base <sha>]` -- and with nothing for a verdict that does not. It is read
+ * back by `standingVerdict` when a later head asks to carry the verdict
+ * forward, so the marker is the contract: a description without one is a
+ * verdict that cannot be carried, whatever its state says. A docs-only skip
+ * vouched for no snapshot (nothing ran); a push or a PR-less dispatch had no
+ * base to name. Only a green measured against a named base carries.
+ */
+const BASE_MARKER = /\[base ([^\s\]]+)\]$/;
+
+/** The description `gate`'s verdict publishes. */
+export function describeVerdict(verdict) {
+  const lane = verdict ? verdict.lane : "code";
+  const base = verdict && verdict.baseSha ? ` [base ${verdict.baseSha}]` : "";
+  if (lane === "docs") return "Documentation-only diff; the heavy jobs were skipped.";
+  if (lane === "generated") {
+    return `Generated-only push; verdict carried forward from ${verdict.carriedFrom.slice(0, 7)}.${base}`;
+  }
+  return `Every required job passed.${base}`;
+}
+
+/** The base a published description was measured against, or null. */
+export function carriedBase(description) {
+  const m = BASE_MARKER.exec(description || "");
+  return m ? m[1] : null;
+}
+
+/**
+ * The login the App posts statuses under -- `<slug>[bot]` -- resolved from
+ * the credential itself, never from anything a checkout or a policy could
+ * supply. `GET /app` answers only to the App's own JWT, so the login this
+ * returns is the identity that key actually holds.
+ */
+export async function appLogin({ appId, privateKey }, fetchImpl = fetch, sign = defaultSign) {
+  const res = await fetchImpl("https://api.github.com/app", {
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${signAppJwt(appId, privateKey, undefined, sign)}`,
+      "x-github-api-version": "2022-11-28",
+    },
+  });
+  if (!res.ok) {
+    throw new PolicyError(`Could not read the App's own identity (GitHub API ${res.status}).`);
+  }
+  const slug = (await res.json()).slug;
+  if (!slug) {
+    throw new PolicyError(`The App's own record names no slug — its status login cannot be established.`);
+  }
+  return `${slug}[bot]`;
+}
+
+/**
+ * Did the trusted App, or someone who administers the repository, make the
+ * push a carry would vouch for? Refuses otherwise, by name.
+ *
+ * The permission is the API's record for that login -- `admin` and nothing
+ * less. `write` is not enough: a collaborator who can push to a branch
+ * cannot merge past the ruleset, and a carried verdict is precisely what
+ * would let them. A fork contributor's push arrives as their own login,
+ * which the record answers `read` or `none` for. The App's own login is
+ * accepted without a lookup: it is the identity the credential already
+ * proved, and a bot user has no collaborator record to read.
+ */
+export async function pushedByTrusted(sender, appLogin, ctx) {
+  if (!sender) {
+    throw new PolicyError(
+      `The event names no sender — a carry vouches for who pushed the generated files, and this ` +
+        `push has no account of that.`,
+    );
+  }
+  if (sender === appLogin) return;
+  const record = await api(`collaborators/${encodeURIComponent(sender)}/permission`, ctx);
+  if (!record || record.permission !== "admin") {
+    throw new PolicyError(
+      `This push was made by ${JSON.stringify(sender)}, whose permission here is ` +
+        `${JSON.stringify(record ? record.permission : undefined)} — only an administrator's push, or the ` +
+        `App's own, carries a verdict across generated files, since the carry skips the re-render ` +
+        `that would otherwise overwrite them.`,
+    );
+  }
+}
+
+/**
+ * The `lanes` verdict already standing on a commit, in the one form a
+ * verdict can be carried forward in: the status the trusted App published,
+ * read from the commit's status list rather than from the check runs, and
+ * accepted only when its creator IS that App.
+ *
+ * The check runs are not consulted, and that is the trust story of the
+ * generated lane in one line. Under `pull_request_target` GitHub attributes
+ * a job's ambient check-run to the BASE branch's tip (see `statusSha`), and
+ * under `pull_request` the job that produced it is the pull request's own
+ * copy of the workflow -- so a check run named `lanes` on a commit says
+ * nothing reliable about which run put it there or what it read. The
+ * App-posted status was written onto the exact commit the event named, by
+ * this engine, with a description this engine wrote. A consumer on the
+ * ambient template therefore never carries a verdict: the generated lane
+ * requires trusted publishing, and classifies as code without it.
+ *
+ * The context name alone proves nothing, and the creator is what does. Any
+ * workflow holding `statuses: write` -- a pull request's own, under plain
+ * `pull_request` -- can post a `lanes` status carrying `success` and a
+ * forged `[base <sha>]`, then push generated files onto it and have the
+ * forgery carried (Codex on PR #28). So the entry is accepted only when its
+ * creator is the login the App's own credential resolves to
+ * (`appLogin`), which a forger holds no key for. The list is newest first,
+ * and the newest `lanes` entry is the one that stands -- so a forgery posted
+ * after the real one shadows it and refuses: the code lane, never a carried
+ * lie.
+ *
+ * The attestation first, the required status as the fallback. On a consumer
+ * whose run pushes generated files after its heavy jobs, `lanes` on the
+ * previous head is never green when the pushed head asks -- the push's own
+ * run cancels the one that would have published it, which is also what
+ * keeps a head from merging before its own push lands -- so what stands
+ * there is `lanes-attest`, posted before the push (`attest` mode). Where
+ * both stand, the attestation is the one that speaks for the heavy jobs.
+ *
+ * The plain status list, not the combined status. The combined endpoint
+ * embeds a PAGE of its `statuses` in an object, which `api()` returns
+ * whole without following the page links -- so a commit carrying more
+ * contexts than fit on one page could hide `lanes` on a page never read
+ * and refuse a verdict that stands (Codex on PR #28). The list endpoint is
+ * an ordinary paginated array, which `api()` follows to the end.
+ */
+export async function standingVerdict(sha, ctx, expectedLogin) {
+  if (!expectedLogin) {
+    throw new PolicyError(
+      `A standing verdict can only be trusted from the App that published it, and no App login ` +
+        `was established to check it against.`,
+    );
+  }
+  const statuses = await api(`commits/${sha}/statuses?per_page=100`, ctx);
+  // Newest first, so the first entry per context is the one that stands.
+  const status =
+    statuses.find((s) => s && s.context === ATTEST_CONTEXT) ||
+    statuses.find((s) => s && s.context === REQUIRED_CONTEXT);
+  if (!status) {
+    throw new PolicyError(
+      `Commit ${sha} carries no published lanes status — nothing vouches for it, so nothing can be ` +
+        `carried forward onto a head built on it. (The ambient check-run is not read; see the README.)`,
+    );
+  }
+  const creator = status.creator || {};
+  if (creator.type !== "Bot" || creator.login !== expectedLogin) {
+    throw new PolicyError(
+      `The lanes status on ${sha} was posted by ${JSON.stringify(creator.login || "")}, not by the ` +
+        `App (${expectedLogin}) — a status anyone with statuses:write can post is not a verdict.`,
+    );
+  }
+  if (status.state !== "success") {
+    throw new PolicyError(
+      `The lanes status on ${sha} is '${status.state}', not success — only a green verdict carries forward.`,
+    );
+  }
+  const baseSha = carriedBase(status.description);
+  if (!baseSha) {
+    throw new PolicyError(
+      `The lanes status on ${sha} names no base it was measured against ` +
+        `(${JSON.stringify(status.description || "")}) — a docs-only skip, a push, or a PR-less ` +
+        `dispatch vouches for no merge snapshot, so there is nothing to carry forward.`,
+    );
+  }
+  return { sha, baseSha };
 }
 
 // --- Modes -----------------------------------------------------------------
@@ -1135,6 +1360,139 @@ export async function classify(env, policy, ctx) {
 }
 
 /**
+ * true when this run's event added only generated files to a head whose
+ * verdict already stands, so the heavy jobs may skip and that verdict be
+ * carried forward onto the new head.
+ *
+ * The case is a workflow writing its own output back onto the branch: a
+ * screenshot job re-records its baselines and commits them, and that commit
+ * starts a fresh run whose heavy jobs redo, on a head differing only by the
+ * images they themselves produced, everything the previous head's run just
+ * did -- and every other verdict on the pull request (an automated review's,
+ * say) is revoked by the push too. The docs lane cannot cover it: the pull
+ * request's DIFF is code. So this asks a different question -- not "is the
+ * diff inert" but "is the PUSH inert, on top of a head already vouched for".
+ *
+ * Every one of these has to hold, and every failure to establish one is
+ * code:
+ *
+ *   - the event is a `synchronize`, the only pull_request action carrying
+ *     `before`/`after`. An opened, reopened or edited run has no range and
+ *     takes the lane its diff earns;
+ *   - the range is exactly the push the event describes: `after` is the
+ *     event's head, and `before...after` compares ahead (`pushedPaths`), so
+ *     a force-push, whose `before` leads nowhere, is refused;
+ *   - every path in that range matches a `generated` rule, and there is at
+ *     least one;
+ *   - the head is not shared with another open pull request, for the reason
+ *     `classify` gives;
+ *   - the pull request does not change the policy. The rules judging the
+ *     range are read from the pull request's own merge ref, and only the
+ *     range is judged -- so a pull request could first add
+ *     `generated src/**`, earn a legitimate green on that head (the policy
+ *     edit is code, so the heavy jobs ran), then push source alone and have
+ *     it carried (Codex on PR #28). The docs lane is immune because the
+ *     policy file is always code in the FULL diff it judges; the generated
+ *     lane gets the same protection by refusing outright while the policy
+ *     is under review -- every push to such a pull request takes the full
+ *     lane, the rules included;
+ *   - the push was made by someone who administers the repository, or by
+ *     the App itself. The files a `generated` rule names are the ones CI
+ *     writes back, and on the code lane CI overwrites whatever a hand
+ *     pushed there with what it rendered; the carry skips exactly that
+ *     correction, so a hand-pushed image under a generated path would
+ *     otherwise ride an attested head straight to the default branch
+ *     (Codex on typelauncher#721). An administrator can land anything
+ *     already, so their push carries; a collaborator's, or a fork
+ *     contributor's, takes the full lane. The pusher is the event's
+ *     `sender`, and the permission is the API's own record of it -- never a
+ *     login the policy could name;
+ *   - `before` carries a `lanes: success` whose creator is the trusted App
+ *     -- resolved from this run's own App credential, so a consumer that
+ *     hands classify no credential never carries; the ambient check-run
+ *     and a status under the right name from anyone else are not accepted;
+ *     see `standingVerdict`;
+ *   - and that verdict was measured against THIS event's base commit. The
+ *     heavy jobs validated merge(before, base-then); this run publishes for
+ *     merge(after, base-now); the two are one snapshot plus generated files
+ *     only while the base has not moved between them. The base is read back
+ *     from the status's own description, written for exactly this
+ *     (`describeVerdict`), and the gate's `stillPinned` then holds this
+ *     event's base to the tip at settlement as it does for every verdict.
+ *
+ * The generated files are never inspected beyond their paths. The policy's
+ * `generated` rule is the consumer's statement that nothing under it changes
+ * what the heavy jobs validate, exactly as a `docs` rule is; what this adds
+ * over the docs lane is the carry, and the carry is what the base match
+ * keeps honest.
+ */
+export async function classifyGenerated(env, policy, ctx) {
+  const { event, pr, snapshot } = env;
+  if (event !== "pull_request" && event !== "pull_request_target") return false;
+  if (!pr || !snapshot) return false;
+  // A policy with no `generated` rule has opted out; nothing below is read.
+  if (!policy.rules.some((r) => r.verdict === "generated")) return false;
+  // Not a synchronize: nothing was pushed, so there is no range to judge.
+  if (!snapshot.before || /^0+$/.test(snapshot.before)) return false;
+  // Before any read: the verdict this would carry is only as trustworthy as
+  // the identity it is checked against, and that identity comes from the
+  // App credential alone. Refused, not `false`, so classify's warning and
+  // the gate's refusal both name the missing wiring.
+  const creds = env.appCreds || {};
+  if (!creds.appId || !creds.privateKey) {
+    throw new PolicyError(
+      `The generated lane carries a verdict only the trusted App could have published, and this run ` +
+        `holds no App credential to identify it by — supply app-id and app-private-key to classify ` +
+        `as well as to the gate.`,
+    );
+  }
+  if (!snapshot.after || snapshot.after !== snapshot.head) {
+    throw new PolicyError(
+      `This event's push landed ${JSON.stringify(snapshot.after)} but its head is ` +
+        `${JSON.stringify(snapshot.head)} — refusing to carry a verdict across a range that does ` +
+        `not end at the commit it would label.`,
+    );
+  }
+  if (!snapshot.baseSha) {
+    throw new PolicyError(
+      `The event payload names no base commit — a carried verdict has nothing to be matched against.`,
+    );
+  }
+  const meta = await api(`pulls/${pr}`, ctx);
+  if (meta.head.sha !== snapshot.head) {
+    throw new PolicyError(
+      `The pull request's head moved after this run's event (${snapshot.head} -> ${meta.head.sha}) — ` +
+        `the replacement head's own run owns the verdict.`,
+    );
+  }
+  const heads = await openPrsHeading(meta.head.sha, ctx);
+  if (heads.length !== 1 || heads[0] !== Number(pr)) return false;
+  // Both sides of every rename and every spelling, as `isDocs` treats the
+  // policy path: on a case-insensitive filesystem `.github/LANES.conf` can
+  // be the policy in force.
+  if ((await changedPaths(pr, ctx)).some((p) => p.toLowerCase() === POLICY_PATH)) {
+    throw new PolicyError(
+      `This pull request changes ${POLICY_PATH} — a verdict is never carried across rules still ` +
+        `under review, so every push to it takes the full lane.`,
+    );
+  }
+  const paths = await pushedPaths(snapshot.before, snapshot.after, ctx);
+  if (paths.length === 0) return false;
+  if (!paths.every((p) => isGenerated(p, policy.rules))) return false;
+  const login = await appLogin(creds, ctx.fetchImpl, ctx.sign);
+  await pushedByTrusted(snapshot.sender, login, ctx);
+  const standing = await standingVerdict(snapshot.before, ctx, login);
+  if (standing.baseSha !== snapshot.baseSha) {
+    throw new PolicyError(
+      `The verdict on ${snapshot.before} was measured against base ${standing.baseSha}, but this ` +
+        `event's base is ${snapshot.baseSha} — the heavy jobs never saw the snapshot this run would ` +
+        `publish for, so nothing carries forward.`,
+    );
+  }
+  return true;
+}
+
+/**
  * Run the whole classify path, reporting ANY failure to establish docs-only
  * as code.
  *
@@ -1160,7 +1518,10 @@ export async function classifyOrCode(work, warn = (m) => process.stdout.write(m)
   try {
     return await work();
   } catch (err) {
-    warn(`::warning::Could not establish a docs-only diff (${err.message}) — taking the code lane.\n`);
+    warn(
+      `::warning::Could not establish a docs-only or generated-only diff (${err.message}) — ` +
+        `taking the code lane.\n`,
+    );
     return false;
   }
 }
@@ -1370,10 +1731,18 @@ export async function gate(env, policy, ctx, pin = null) {
     // separate reads. Settle before reporting, exactly as the skip path does:
     // a green verdict for a snapshot the pull request no longer shows is the
     // same failure as an unjustified skip, arrived at from the other side.
-    if (env.event === "push") return await settlePush(env, ctx);
-    if (prLessDispatch) await stillUnclaimed(env.sha, ctx);
-    else await stillPinned(env.pr, pin, policy, ctx);
-    return;
+    if (env.event === "push") {
+      await settlePush(env, ctx);
+      return { lane: "code" };
+    }
+    if (prLessDispatch) {
+      await stillUnclaimed(env.sha, ctx);
+      return { lane: "code" };
+    }
+    await stillPinned(env.pr, pin, policy, ctx);
+    // The base the verdict names is the one it was settled against, which
+    // is what lets a later generated-only head carry it (`classifyGenerated`).
+    return { lane: "code", baseSha: pin ? pin.baseSha : null };
   }
   if (!allSkipped) {
     throw new PolicyError(
@@ -1383,9 +1752,31 @@ export async function gate(env, policy, ctx, pin = null) {
   // The skip is only as good as the reason for it: re-derive the
   // classification here, independently of the output that caused it.
   if (!(await classify(env, policy, ctx))) {
-    throw new PolicyError(
-      `Heavy jobs were skipped but the diff could not be verified as docs-only — refusing the skip.`,
-    );
+    // The other justified skip: a synchronize that added only generated files
+    // to a head already vouched for. Checked after the docs lane, never
+    // instead of it, and only for a pull request -- a push has no head to
+    // carry from.
+    const generated = env.event !== "push" && (await classifyGenerated(env, policy, ctx));
+    if (!generated) {
+      throw new PolicyError(
+        `Heavy jobs were skipped but the diff could not be verified as docs-only or generated-only ` +
+          `— refusing the skip.`,
+      );
+    }
+    // The pushed commits are housekeeping by construction -- they changed
+    // nothing the heavy jobs validate -- so they carry a prefix like any
+    // docs-lane subject. The title is NOT linted: this is a code pull
+    // request whose title describes the code, and its subjects were each
+    // held to whatever lane they rode when pushed.
+    lintSubjects(await pushedCommits(env.snapshot.before, env.snapshot.after, ctx), policy);
+    await stillPinned(env.pr, pin, policy, ctx);
+    return {
+      lane: "generated",
+      carriedFrom: env.snapshot.before,
+      // Settled equal to the event's base a moment ago, and equal by
+      // construction to the base the carried verdict named.
+      baseSha: pin ? pin.baseSha : null,
+    };
   }
   // After the re-derivation, never before it: a push's skip is only as good
   // as the reason for it, exactly like a pull request's.
@@ -1402,12 +1793,16 @@ export async function gate(env, policy, ctx, pin = null) {
   // `total_commits` refuses rather than waving the skip through.
   if (env.event === "push") {
     lintSubjects(await pushedCommits(env.snapshot.before, env.sha, ctx), policy);
-    return await settlePush(env, ctx);
+    await settlePush(env, ctx);
+    return { lane: "docs" };
   }
   await lintPrefixes(env.pr, policy, ctx, pin);
   // After every read the verdict rests on, not before them.
   if (prLessDispatch) await stillUnclaimed(env.sha, ctx);
   else await stillPinned(env.pr, pin, policy, ctx);
+  // No base, deliberately: a docs skip vouched for no snapshot, so nothing
+  // may carry it forward as if the heavy jobs had run.
+  return { lane: "docs" };
 }
 
 // --- The run --------------------------------------------------------------
@@ -1435,8 +1830,8 @@ export async function main(env = process.env) {
   const mode = input("mode");
   // Before anything else, so an unknown mode is an error rather than a
   // classify-shaped fallback that reports code and exits 0.
-  if (mode !== "classify" && mode !== "gate" && mode !== "init") {
-    throw new PolicyError(`Unknown mode '${mode}' — expected 'classify', 'gate', or 'init'.`);
+  if (mode !== "classify" && mode !== "gate" && mode !== "attest" && mode !== "init") {
+    throw new PolicyError(`Unknown mode '${mode}' — expected 'classify', 'gate', 'attest', or 'init'.`);
   }
   const ctx = { token: input("token"), repo: env.GITHUB_REPOSITORY };
   const appCreds = { appId: input("app-id"), privateKey: input("app-private-key") };
@@ -1449,6 +1844,7 @@ export async function main(env = process.env) {
   }
 
   let baseSha = "";
+  let verdict = null;
   // One body for both modes, so neither can grow a check the other lacks.
   const work = async () => {
     const policy = parsePolicy(readPolicy());
@@ -1463,6 +1859,10 @@ export async function main(env = process.env) {
       dispatchWithoutPr: policy.dispatchWithoutPr,
       baseSha: input("base-sha"),
       snapshot,
+      // Read by the generated lane only, to identify the App whose standing
+      // verdict a push may carry forward. Empty in both modes on a consumer
+      // without trusted publishing, which then never carries.
+      appCreds,
     };
     verifyPrBinding(shared);
     // Exactly one of these returns a pin; the other is a no-op for this event.
@@ -1475,35 +1875,58 @@ export async function main(env = process.env) {
       baseSha =
         (snapshot && snapshot.baseSha) ||
         (pin && pin.baseRef ? await baseTip(pin.baseRef, ctx) : "");
-      return classify(shared, policy, ctx);
+      // The docs question first; the generated one only when it was not
+      // docs, since either answer skips the same jobs and the second costs
+      // API reads the first makes unnecessary.
+      const docsOnly = await classify(shared, policy, ctx);
+      const generatedOnly = docsOnly ? false : await classifyGenerated(shared, policy, ctx);
+      return { docsOnly, generatedOnly };
     }
-    await gate(shared, policy, ctx, pin);
-    return false;
+    verdict = await gate(shared, policy, ctx, pin);
+    return null;
   };
 
   // The gate fails on all of it; classify fails on none of it.
-  if (mode === "gate") {
+  // `attest` is `gate` under another context, with one difference decided
+  // up front: it exists only to be read back by `standingVerdict`, which
+  // accepts nothing the App did not post, so an attestation this run
+  // cannot publish as the App is not worth computing.
+  if (mode === "attest" && !(appCreds.appId && appCreds.privateKey)) {
+    throw new PolicyError(
+      `attest mode publishes the ${ATTEST_CONTEXT} status as the App, and nothing reads one posted ` +
+        `any other way — supply app-id and app-private-key.`,
+    );
+  }
+  if (mode === "gate" || mode === "attest") {
     let err = null;
     try {
       await work();
     } catch (e) {
       err = e;
     }
+    if (mode === "attest") {
+      await publishResult(env, err, appCreds, undefined, undefined, verdict, ATTEST_CONTEXT);
+      return;
+    }
     // Opt-in: a consumer that supplies neither credential gets exactly the
     // behavior this had before either existed -- throw or return, and let
     // the ambient Actions check-run report it, same as today.
     if (appCreds.appId || appCreds.privateKey) {
-      await publishResult(env, err, appCreds);
+      await publishResult(env, err, appCreds, undefined, undefined, verdict);
       return;
     }
     if (err) throw err;
     return;
   }
-  const docsOnly = await classifyOrCode(work);
+  // The fallback is a bare `false`, the same answer to both questions.
+  const lane = (await classifyOrCode(work)) || { docsOnly: false, generatedOnly: false };
   // Emitted even when the classification failed to establish: the gate's own
   // binding is a separate question from what the diff turned out to be, and a
   // blank here would refuse a green the caller could have proved.
-  const out = `docs_only=${docsOnly}\nbase_sha=${baseSha}\n`;
+  const out =
+    `docs_only=${lane.docsOnly === true}\n` +
+    `generated_only=${lane.generatedOnly === true}\n` +
+    `base_sha=${baseSha}\n`;
   if (env.GITHUB_OUTPUT) appendFileSync(env.GITHUB_OUTPUT, out);
   else process.stdout.write(out);
 }

@@ -7,10 +7,14 @@ inputs:
   mode:
     description: >-
       'classify' to decide whether the heavy jobs may skip (sets the docs_only
-      output), 'gate' to render the verdict the ruleset requires, or 'init' to
-      post a `pending` status before anything else in the graph runs. The gate
-      re-derives the classification itself rather than trusting the output, so
-      a classification bug is a red check rather than a silent merge.
+      and generated_only outputs), 'gate' to render the verdict the ruleset
+      requires, 'attest' to publish that same verdict under `lanes-attest`
+      before a job that pushes generated files (so the pushed head has a
+      verdict to carry while `lanes` itself waits for the push; needs the
+      App credential), or 'init' to post a `pending` status before anything
+      else in the graph runs. The gate re-derives the classification itself
+      rather than trusting the output, so a classification bug is a red
+      check rather than a silent merge.
     required: true
   pr:
     description: >-
@@ -55,7 +59,10 @@ inputs:
     default: ${{ github.token }}
   app-id:
     description: >-
-      init mode always, gate mode optionally. The ID of a dedicated GitHub
+      init mode always; gate mode optionally; classify mode for the
+      generated lane, which carries forward only a `lanes` status this App
+      itself posted and needs the credential to know the App's login. The
+      ID of a dedicated GitHub
       App whose identity a ruleset can restrict the required check to. `gate`
       mode still works exactly as before -- throw or return, no status posted
       -- when this and app-private-key are both empty; supply both to also
@@ -70,8 +77,8 @@ inputs:
     default: ''
   app-private-key:
     description: >-
-      init mode always, gate mode optionally. The App's PEM private key. See
-      app-id.
+      init mode always; gate mode optionally; classify mode for the
+      generated lane. The App's PEM private key. See app-id.
     required: false
     default: ''
 
@@ -83,6 +90,15 @@ outputs:
       files, or on an opted-in push the range it added -- 'false' otherwise --
       including every failure to establish it, so an unreadable diff runs the
       full lane.
+  generated_only:
+    description: >-
+      classify mode only. 'true' when this run's event pushed only files
+      matching the policy's `generated` rules onto a head whose App-published
+      `lanes` status is green against the same base -- a workflow committing
+      its own output back, such as re-recorded screenshots -- so the heavy
+      jobs may skip and the gate carries that verdict forward. 'false'
+      otherwise, including every failure to establish it and every consumer
+      without trusted publishing. Gate the heavy jobs on both outputs.
   base_sha:
     description: >-
       classify mode only. The base branch tip as it stood before the heavy
