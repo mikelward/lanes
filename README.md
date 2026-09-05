@@ -55,9 +55,18 @@ code docs/REFERENCE.md    # compiled in by a test; see the trap below
 docs *.md
 docs docs/**/*.md        # `**`, not `*` -- see "Writing your policy" below
 
+# Optional. Files a workflow writes back onto the branch -- re-recorded
+# screenshots, say. A push adding ONLY these to a head whose `lanes` status is
+# already green carries that verdict forward instead of rerunning everything.
+# Same first-match-wins order as the rules above. See "Carrying a verdict
+# across generated files" below; it needs trusted publishing.
+generated app/src/test/snapshots/images/**
+
 # Commit-subject prefixes the docs lane accepts. On that lane every commit
-# must carry one, so nothing riding it reads like a behavior change.
-prefixes design docs todo test build refactor
+# must carry one, so nothing riding it reads like a behavior change. The
+# generated lane lints the pushed commits against the same list, so the
+# prefix the refresh commit carries -- `ci` here -- has to be on it too.
+prefixes ci design docs todo test build refactor
 
 # Optional; defaults to refuse. `allow` accepts a PR-less dispatch against
 # ANY ref -- including a pull request's own branch, running that branch's own
@@ -127,6 +136,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       docs_only: ${{ steps.lane.outputs.docs_only }}
+      generated_only: ${{ steps.lane.outputs.generated_only }}
       base_sha: ${{ steps.lane.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v5
@@ -140,7 +150,9 @@ jobs:
 
   # ... your heavy jobs, each with:
   #   needs: classify
-  #   if: needs.classify.outputs.docs_only != 'true'
+  #   if: needs.classify.outputs.docs_only != 'true' && needs.classify.outputs.generated_only != 'true'
+  # (`generated_only` is only ever true under a `generated` rule, so a policy
+  # without one can gate on `docs_only` alone.)
 
   lanes:
     name: lanes
@@ -406,6 +418,166 @@ pull-request gate, which is the thing responsible for it — the same reason
 strictly stronger than the `paths:` filter it replaces, which skips the entire
 run on a policy nothing checks at all.
 
+## Carrying a verdict across generated files
+
+Some workflows write their own output back onto the branch. The pattern this
+was built for: a screenshot job re-records its baselines against the pull
+request's head, and a downstream job commits the drift back
+(`mikelward/ci-commit-artifact` does the commit). That commit is a push, so it
+starts a fresh run — and the fresh run's heavy jobs redo, on a head that
+differs from the previous one only by the images those jobs themselves
+produced, everything the previous head's run just did. Every other verdict on
+the pull request goes with it: an automated reviewer revokes its approval on
+push, and re-reviews a diff that changed by nothing it can read.
+
+The docs lane cannot cover this. The pull request's *diff* is code — that is
+why the screenshot job ran at all. So the generated lane asks a different
+question: not *is the diff inert* but *was the push inert, on top of a head
+already vouched for*. A policy names the files a workflow writes:
+
+```
+generated app/src/test/snapshots/images/**
+```
+
+and `classify` sets `generated_only` when **all** of the following hold. Every
+failure to establish one is code, exactly as on the docs lane:
+
+| requirement | why |
+|---|---|
+| the event is a `synchronize` | the only `pull_request` action that carries `before`/`after`, so a run for `opened`, `reopened`, or `edited` has no range and takes the lane its diff earns |
+| `before...after` compares `ahead`, and `after` is the event's head | the same proof `push classify` demands: a force-push's range describes commits it did not add |
+| every path in that range matches a `generated` rule, and there is at least one | the policy's statement that nothing under it changes what the heavy jobs validate — the same trust a `docs` rule carries, and the same first-match-wins order |
+| the head is not shared with another open pull request | a status is per-commit; see *What the gate refuses* |
+| the push was made by a repository **administrator**, or by the App itself | the files a `generated` rule names are the ones CI writes back, and on the code lane CI overwrites whatever a hand pushed there with what it rendered — the carry skips exactly that correction. An administrator can land anything already; a collaborator's push, or a fork contributor's, takes the full lane. The pusher is the event's `sender`; the permission is the API's own record of it |
+| the pull request does not change `.github/lanes.conf` | the rules judging the range are read from the pull request's own merge ref, and only the range is judged — so a pull request could add `generated src/**`, earn a green on that head, then push source alone. The docs lane is immune because the policy file is always code in the full diff; here the carry is refused outright while the policy is under review |
+| `before` carries a `lanes-attest: success`, or failing that a `lanes: success`, **posted by the trusted App** | the ambient check-run is not read — under `pull_request_target` GitHub attributes it to the base branch's tip, and under `pull_request` the job that produced it is the pull request's own copy of the workflow. Nor is the context name proof of anything: any workflow holding `statuses: write` can post a `lanes` status carrying `success` and a forged base marker. So the status's *creator* must be the App's own login, resolved from the credential this run holds (`GET /app`) — never from a policy or a checkout. **The generated lane therefore requires *Trusted publishing*, with `app-id` and `app-private-key` supplied to `classify` as well as to the gate**, and classifies as code without them |
+| that verdict was measured against **this event's base commit** | the heavy jobs validated `merge(before, base-then)`; this run publishes for `merge(after, base-now)`; those are one snapshot plus generated files only while the base has not moved between them |
+
+The last row is what the status *description* is for. A green published on a
+pull request ends with `[base <sha>]`, naming the base it was settled against;
+the gate reads it back before carrying. A docs-only skip, a push's verdict, and
+a PR-less dispatch name no base, because none of them vouched for a merge
+snapshot — so none of them carries, whatever their state says. A carried
+verdict names the base it inherited, so a second generated push carries again.
+
+`classify` needs more than the template above gives it: `statuses: read` on
+its token (a `permissions:` block that lists only `contents` and
+`pull-requests` grants nothing else, and on a private repository the status
+read then fails, which classifies as code), and the App credential, so it
+declares the same `environment:` as `init` and `finalize`. The engine is
+still the only thing that job runs; the credential is used there for one read
+of the App's own record. The gate's job takes the same `statuses: read`.
+
+```yaml
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: lanes
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+    outputs:
+      docs_only: ${{ steps.lane.outputs.docs_only }}
+      generated_only: ${{ steps.lane.outputs.generated_only }}
+      base_sha: ${{ steps.lane.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with: { persist-credentials: false }
+      - uses: mikelward/lanes@main
+        id: lane
+        with:
+          mode: classify
+          pr: ${{ github.event.pull_request.number }}
+          app-id: ${{ secrets.LANES_APP_ID }}
+          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}
+```
+
+**Publish the verdict before the push, and keep the required check after it.**
+The job that pushes generated files starts the next run, and under a per-PR
+`cancel-in-progress` group that run cancels this one — so a `lanes` verdict
+queued behind the push never publishes, and there is nothing to carry. Yet
+`lanes` *must* stay behind the push: a green required check published before
+it lets a merge land between the two, with the refreshed files never
+committed. The two questions come apart exactly there, so they get two
+statuses. `mode: attest` runs the gate's whole verdict and publishes it under
+**`lanes-attest`**, as the App, from a job that runs *before* the push;
+`standingVerdict` carries from that context first and falls back to `lanes`
+for consumers that have no such job. `lanes` itself is published by `finalize`
+after the push job, exactly as before, with that job's result in its
+`results` — and on the pushed head's own run, where the heavy jobs skip, the
+gate carries the previous head's attestation and publishes `lanes` green.
+
+```yaml
+  attest:
+    runs-on: ubuntu-latest
+    needs: [classify, check, msrv]
+    if: ${{ !cancelled() }}
+    environment: lanes
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@v5
+        with: { persist-credentials: false }
+      - uses: mikelward/lanes@main
+        with:
+          mode: attest
+          # ...the same inputs as the gate, without the push job's result...
+          app-id: ${{ secrets.LANES_APP_ID }}
+          app-private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}
+
+  push-generated:
+    needs: [classify, check, attest]   # after the attestation, never before
+    environment: lanes
+    permissions:
+      contents: read
+    steps:
+      # The push has to come from a repository administrator or from the
+      # App itself (see the requirement table): `GITHUB_TOKEN` pushes as
+      # `github-actions[bot]`, which is neither — and a push it makes starts
+      # no run anyway. Either an administrator's own token, held in this
+      # environment, or the App's installation token, minted from the same
+      # credential; the App then needs `contents: write` on the repository.
+      # Mint it with `contents` ALONE: the App also holds `statuses: write`,
+      # and a token carrying that could post a `lanes` or `lanes-attest`
+      # success under the App's own login — the exact creator the carry
+      # trusts. Status writing stays confined to the publishing jobs, which
+      # hold the private key and never run anything the pull request wrote.
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ secrets.LANES_APP_ID }}
+          private-key: ${{ secrets.LANES_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ steps.app.outputs.token }}
+      # ...download the artifact, commit, and push with that token...
+```
+
+The pushed head's `synchronize` event then names the App's login (or the
+administrator) as its `sender`, which is what `pushedByTrusted` reads. A
+consumer whose push goes through a reusable workflow of its own (the fleet's
+is mikelward/ci-commit-artifact) hands it the same token as its push
+credential; whichever way, the identity that pushes is the one checked, not
+the job that asked for the push.
+
+The gate re-derives all of it, as it does for every skip, lints the pushed
+commits' subjects against `prefixes` (they changed nothing the heavy jobs
+validate, so they are housekeeping by construction — `ci:` is the usual one,
+and whichever it is, it has to be on the policy's `prefixes` list, or the
+gate refuses the very push the lane exists for),
+leaves the pull request's *title* alone (it describes the code the pull
+request is), and settles against the event's base exactly as a green does.
+
+**What it does not do.** It never looks inside a generated file. A `generated`
+rule that names a path the heavy jobs actually read is the same mistake as a
+`docs` rule that does — see *The trap* below — and the rule to write it by is
+the same: name what the workflow *writes*, and nothing the build *reads*.
+
 ## What binds a verdict to the diff it was computed for
 
 A check run lands on a commit, and is read by whatever the pull request looks
@@ -634,6 +806,17 @@ Each of these is a case where a skip *looks* justified and is not:
   from naming docs-only PR B and landing B's clean verdict on A's head.
 - **An unprefixed subject.** Merge commits are exempt structurally, by parent
   count — a commit whose subject merely starts with "Merge" is not one.
+- **A carry of a hand-made push.** A generated-only push made by anyone but a
+  repository administrator or the App itself: the carry skips the re-render
+  that would have overwritten what they pushed.
+- **A carry under rules still being reviewed.** A generated-only push on a
+  pull request that itself edits `.github/lanes.conf`: the rules that would
+  judge the range are the ones under review.
+- **A carry with nothing to carry.** A generated-only push onto a head whose
+  `lanes` status is missing, red, pending, posted by anyone but the App
+  (the ambient check-run included), or measured against a base this event
+  no longer has.
+  See *Carrying a verdict across generated files*.
 
 ## Versioning
 
