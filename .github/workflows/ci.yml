@@ -1,4 +1,4 @@
-name: CI
+name: ci
 
 # Consumers track `@main` -- no tag, no SHA, deliberately, since bumping a pin
 # in every repository is the cost centralizing was meant to remove. So this

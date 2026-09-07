@@ -119,6 +119,13 @@ describe("this repository's own lane", () => {
     return m ? m[1] : "";
   };
 
+  test("names the workflow in lowercase, matching the filename and the fleet", () => {
+    // The display name is `ci`, not `CI` -- both directions, since the whole
+    // point is the lowercase spelling the fleet standardized on.
+    assert.match(workflow, /^name: ci$/m);
+    assert.doesNotMatch(workflow, /^name: CI$/m);
+  });
+
   test("classify and the gate run the merged engine; only test runs the branch's copy", () => {
     // In the lane jobs, `uses: $/` (or the workspace-relative `./`) would
     // let a pull request rewrite the engine and be judged by its own
