@@ -557,6 +557,35 @@
       requiring the CI gate, the `codex` status, conversation resolution
       and up-to-date branches, and the auto-merge setting enabled.
 
+## Policy syntax ergonomics for "markdown docs" (deferred)
+
+- [ ] **The natural way to say "root + `docs/` tree markdown" is not the
+      correct way, and that is worth fixing later — the standard is not
+      blocked on it.** The evidence is intent, not current configs (the
+      configs are survivorship bias — repos that reached for the natural
+      form, got silently bitten, and rewrote): nine consumers wrote the
+      over-broad `docs **/*.md` because they wanted ONE line for "markdown is
+      docs", and the correct form is two lines (`docs *.md` +
+      `docs docs/**/*.md`), so people route around it. A one-line
+      `docs *.md docs/**/*.md` reads naturally and silently matches nothing,
+      because `parsePolicy` joins the rest of the line into a single glob.
+
+      Two fixes were considered and both deferred (owner, 2026-09-09):
+      - **A named preset** (`docs markdown` → the narrow pair): rejected as
+        ambiguous.
+      - **Splitting a directive line on whitespace into several patterns:**
+        promising but not yet designed, because it must match shell muscle
+        memory and the obvious version does not. In a shell, unquoted
+        whitespace separates AND quoting DISABLES globbing — so "quote a path
+        that still needs to glob" (the escape hatch for a literal space in a
+        path) is backwards from what a shell user expects. The separator and
+        escaping rules need a shell-consistent answer before adopting this;
+        until then a naive split would trade one surprise for another.
+
+      Meanwhile **one pattern per line is the encoded standard**, every
+      consumer already conforms, and the narrow-pair migration below is all
+      one-pattern-per-line — so none of the above blocks it.
+
 ## Reconcile the fleet with the documented docs-lane standard
 
 - [ ] **Decided (2026-09-09, owner): keep the narrow pair as the standard;
