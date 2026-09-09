@@ -894,12 +894,14 @@ export async function verifyDispatchBinding({ event, pr, sha, ref, dispatchWitho
 // The JWT-then-installation-token exchange below (sign a short-lived App JWT,
 // look up this repo's installation, mint a token from it) is GitHub's own
 // long-stable App-authentication flow, not something this repository is
-// inventing -- unlike the `pull_request_target` field semantics elsewhere in
-// this design, which TODO.md flags as unverified against live docs, this
-// mechanism is not in question. What IS still open, and is a consumer
-// workflow's concern rather than this file's, is whether an environment's
-// deployment-branch policy actually restricts a `pull_request_target` run's
-// access to the credential the way the design assumes -- see TODO.md.
+// inventing. The `pull_request_target` field semantics this design leans on
+// -- once flagged here as unverified -- are now confirmed: GitHub's 2025-11-07
+// changelog settles that such a run's ref is the default branch and that an
+// environment's branch policy evaluates against that execution ref, so a
+// default-ref policy admits the trusted publisher and refuses a PR-branch
+// forgery. The consumer workflow still owns declaring that environment; the
+// platform behavior it relies on is no longer in question. See TODO.md and
+// SPEC.md for the citations.
 
 function base64url(bufferOrString) {
   const buf = Buffer.isBuffer(bufferOrString) ? bufferOrString : Buffer.from(bufferOrString);

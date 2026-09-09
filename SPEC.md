@@ -66,3 +66,44 @@ Recovery is the repository admin editing the ruleset (or bypassing it) for
 that one merge, restoring it after. Accepted deliberately: the event needs
 a bug that both slipped the suite and crashes the engine at runtime, and
 the alternative was permanent tooling exceptions to guard against it.
+
+## The fleet standard is App-identity trusted publishing
+
+**Decided (2026-09-09, owner):** the standard shape for a consumer's required
+`lanes` check is the trusted-publishing form — the initializer/finalizer
+posting the `lanes` status authenticated as a dedicated GitHub App, with the
+App credential in a `lanes` environment restricted to the default branch, and
+the ruleset requiring the `lanes` status from that App as its source. The
+ambient form (the `classify`/`lanes` template that trusts the Actions
+check-run) stays documented as the minimal fallback for a consumer that has
+not provisioned the App, but it is not the standard: a same-repo pull request
+can rewrite its own workflow definition or post its own `lanes` status, so the
+ambient check is only as trustworthy as the branch it runs from.
+
+**Why it is now a decision and not a hope.** The design carried a long
+"unproven" caveat in `TODO.md` because it rested on three platform facts this
+repository could not verify (docs.github.com was unreachable). All three are
+now confirmed — `pull_request_target` source/ref is always the default branch;
+environment branch policies evaluate against the execution ref, so a
+default-ref policy admits the trusted jobs and refuses a PR-branch forgery; and
+a ruleset can pin a required status to a specific App source. Together they
+close the self-certification hole the caveat was about. See `TODO.md` for the
+citations and the remaining rollout work (the consumer-workflow migration,
+piloted on one consumer before merge, and the still-open `actions/cache`
+question — the cache stays on until that has a real answer, because the
+fleet's CI is expensive).
+
+**One residual is accepted, not closed, and the standard owns it knowingly.**
+Self-certification (forgery) is closed; freshness is not. If the App
+credential goes bad — revoked, expired, the App uninstalled — a run can post
+neither `pending` nor a fresh verdict, so a prior App-posted `lanes: success`
+stands un-revalidated across a retarget or title edit, and a ruleset requiring
+only `lanes` accepts it. This cannot be closed by an App-authenticated signal,
+because the only thing the App can write is the `lanes` status itself and
+minting the token to write it is exactly what is failing (round nine in
+`TODO.md`). It is mitigated operationally — `init`/`finalize` job failures are
+visible in the Actions tab, or a notification wired to them — not by a required
+check. Adopting App-identity as the standard is a decision made with this gap
+open, on the judgment that a forgery-closed gate with a visible
+credential-health failure mode beats the ambient check it replaces; it is not
+a claim that the gate is fail-closed in every mode.

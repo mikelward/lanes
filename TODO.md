@@ -491,6 +491,62 @@
       the precondition is ever true. Still not blocking the rollout
       already in flight, still the owner's call whether to close it.
 
+      **Resolved: the platform semantics this section left unverified are
+      now confirmed, and the mechanism is no longer unproven against
+      self-certification.** The three facts the design leaned on and could
+      not check (docs.github.com was unreachable throughout) are settled by
+      GitHub's 2025-11-07 changelog "Actions pull_request_target and
+      environment branch protections changes" (effective 2025-12-08) and the
+      rulesets docs:
+      - Under `pull_request_target`, the workflow source, `GITHUB_REF` and
+        `GITHUB_SHA` are ALWAYS the default branch, regardless of the PR's
+        base — so a PR cannot introduce its own `pull_request_target`
+        definition, closing the job-definition-tampering half for that
+        trigger outright.
+      - Environment branch-protection rules now evaluate against the
+        EXECUTION ref (`GITHUB_REF`), not the PR head. Under
+        `pull_request_target` that is the default branch, so a default-ref
+        environment policy admits the initializer/finalizer and refuses a
+        same-repo PR's own `push`-triggered forgery (which runs under the PR
+        branch's ref). The App credential is therefore genuinely
+        unreachable to the forgery route.
+      - A ruleset's required status check can be pinned to a specific App as
+        its expected source: "if the status is set by any other person or
+        integration, merging won't be allowed." So a forged `lanes` status
+        posted by the generic Actions identity does not satisfy the check;
+        only the App's does.
+      The engine half is likewise done, not just specified: `classify`,
+      `verifyPrBinding`, `verifyEventBinding` and `statusSha` all accept
+      `pull_request_target`, reason from the event payload rather than
+      `GITHUB_SHA`/`GITHUB_REF`, and are tested both directions for that
+      trigger. One precision, since an earlier draft of this note overstated
+      it: unknown-event handling is NOT uniformly fail-closed. `classify`
+      returns the code lane (the safe direction) for a trigger it does not
+      recognize, but `verifyPrBinding` falls through, `verifyEventBinding`
+      returns null, and `statusSha` falls back to `GITHUB_SHA` rather than
+      refusing an unsupported event — so a trigger outside
+      pull_request/pull_request_target/workflow_dispatch/push is out of
+      scope by consumer configuration, not by an engine guard. Adding that
+      guard (refuse an unrecognized event in the binding path) is a possible
+      hardening item, listed here rather than claimed done. What remains
+      otherwise is not engine work and not a platform unknown: it is the
+      consumer-workflow rollout, piloted on one consumer before merge (see
+      below), plus the `actions/cache` item broken out as its own TODO.
+
+- [ ] **`actions/cache` under `pull_request_target` in a heavy job — still
+      open, and cache stays ON meanwhile.** A cache write from a heavy job
+      running PR code under `pull_request_target` is attributed to the
+      trusted default ref, so PR-controlled code could plant an entry a
+      later privileged run on the base branch restores and executes.
+      Disabling the cache would close it but is rejected for now: this
+      fleet's CI is expensive and slow, and the cache is load-bearing.
+      The answer is a PR-scoped cache key (restore-only on the base, or a
+      key namespaced by the PR so a poisoned entry can never be restored by
+      a trusted run) or a demonstration that the key space is already
+      unreachable from PR-controlled input — worked out at pilot time, not
+      by turning the cache off. Until it has an answer, a consumer moving a
+      cached heavy job to `pull_request_target` carries this risk knowingly.
+
 ## Review and merge gates
 
 - [ ] Verify the settings half of the fleet's bar — every repository works
@@ -503,9 +559,19 @@
 
 ## Reconcile the fleet with the documented docs-lane standard
 
-- [ ] Decide whether to bring the fleet back to the standard this
-      repository already documents, or to change the standard. Not a
-      missing decision -- a documented one the fleet has drifted from.
+- [ ] **Decided (2026-09-09, owner): keep the narrow pair as the standard;
+      bring the eight shorthand consumers back to it.** The shorthand's
+      failure mode is the one the gate exists to prevent — a markdown file a
+      build or test reads silently rides the docs lane and skips the suite
+      that should have run — while the narrow pair's cost is only a few
+      subdirectory READMEs running a full suite, recoverable with an explicit
+      per-repo `docs <dir>/**/*.md` line. Correctness beats convenience here,
+      and it makes the engine take its own advice. Still open is the
+      execution: migrate lanes, repo, conf, scripts, vcs, unixtools, root and
+      snoozemo off `docs **/*.md` to `docs *.md` + `docs docs/**/*.md` plus
+      whatever `docs <dir>/**/*.md` exceptions each one's own subdirectory
+      doc trees need, one consumer at a time. The measurements below stand as
+      the per-repo worksheet for that migration.
 
       `README.md`'s "Writing your policy" is explicit: `docs *.md` plus
       `docs docs/**/*.md` is "the standard, and it is deliberately narrow",
