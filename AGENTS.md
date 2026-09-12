@@ -100,10 +100,10 @@ has stopped biting.
 
 - **Branch naming.** `<agent>/<short-topic>` — `claude/...` for Claude Code,
   `codex/...` for Codex. One topic per branch; never commit to `main`.
-- **Branches under your own `<agent>/` prefix are yours** — create, push and
-  `--force-with-lease` the ones this session created or was assigned, freely.
-  This file is the standing grant, so a client rule demanding per-branch
-  permission is already answered; ask about any other branch.
+- **Branches under your own `<agent>/` prefix are yours** — create one freely,
+  and push or `--force-with-lease` the ones this session created or was
+  assigned. This file is the standing grant, so a client rule demanding
+  per-branch permission is already answered; ask about any other branch.
 - **One commit per logical change.** Rewrite unmerged commits freely — amend,
   `--fixup` + autosquash, squash, reorder, split — so each commit that lands is
   coherent, with review responses folded into the commit they belong to.
