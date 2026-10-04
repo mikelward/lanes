@@ -11,11 +11,10 @@ Conventions for AI agents working in this repository.
 `CLAUDE.md` is a symlink to this file, so every agent reads the same
 conventions. Edit `AGENTS.md`.
 
-**At the start of every session, print the path of the `AGENTS.md` you loaded
-and its `last_modified` date** (front matter), so a stale or wrong copy is
-caught before it steers the work. Write the home directory as `~` so the path
-carries no real name (see *Privacy*). Bump `last_modified` whenever you edit
-this file.
+**At the start of every session, print the full absolute path of the
+`AGENTS.md` you loaded and its `last_modified` date** (front matter), so a
+stale or wrong copy is caught before it steers the work. Bump `last_modified`
+whenever you edit this file.
 
 This repository is one GitHub Action: an engine that sorts a pull request
 into a CI lane -- code or docs -- and a gate that re-derives that
