@@ -184,7 +184,7 @@ describe("this repository's own lane", () => {
     const policy = parsePolicy(readPolicy(fileURLToPath(new URL("./", import.meta.url))));
     assert.ok(policy.rules.length > 0, "the policy parse found rules");
     assert.ok(policy.prefixes.length > 0, "the policy parse found prefixes");
-    for (const path of ["SPEC.md", "AGENTS.md", "TODO.md", "docs/notes.md"]) {
+    for (const path of ["SPEC.md", "TODO.md", "docs/notes.md"]) {
       assert.equal(isDocs(path, policy.rules), true, `${path} rides the docs lane`);
     }
     // The code direction includes the engine, the manifest, the workflows,
@@ -194,7 +194,7 @@ describe("this repository's own lane", () => {
     // asserts on its content, so a docs-only skip on a README edit would
     // let a broken consumer-facing example merge untested (README.md's own
     // "Writing your policy" section documents exactly this trap).
-    for (const path of ["lanes.mjs", "action.yml", ".github/workflows/ci.yml", "LICENSE", "README.md", POLICY_PATH]) {
+    for (const path of ["lanes.mjs", "action.yml", ".github/workflows/ci.yml", "LICENSE", "README.md", "AGENTS.md", POLICY_PATH]) {
       assert.equal(isDocs(path, policy.rules), false, `${path} rides the code lane`);
     }
     assert.equal(hasPrefix("docs: clarify the README", policy.prefixes), true);
