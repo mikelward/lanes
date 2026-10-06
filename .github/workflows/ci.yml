@@ -102,11 +102,11 @@ jobs:
         with:
           node-version: '24'
 
-      # No install step, because there is nothing to install. Both suites are
+      # No install step, because there is nothing to install. The suites are
       # named rather than globbed: a new test file that nothing runs is a
       # silent gap, and naming it here is the one place that shows up.
       - name: Test
-        run: node --test lanes.test.mjs workflows.test.mjs
+        run: node --test lanes.test.mjs workflows.test.mjs agents-front-matter.test.mjs
 
   # The one check the main ruleset requires, alongside `codex` and
   # `zizmor` (which runs unfiltered on every PR exactly so it can be

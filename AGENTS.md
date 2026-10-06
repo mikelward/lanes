@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-04
+last_modified: 2026-10-06
 ---
 
 # AGENTS.md
@@ -83,10 +83,11 @@ has stopped biting.
 
 ## Testing
 
-- `node --test lanes.test.mjs workflows.test.mjs`. No install step; the first
-  stubs the API and runs the real engine against fixtures, the second pins
-  this repository's own workflows. Both are named in `ci.yml` rather than
-  globbed — a new test file nothing runs is a silent gap.
+- `node --test lanes.test.mjs workflows.test.mjs agents-front-matter.test.mjs`.
+  No install step; the first stubs the API and runs the real engine against
+  fixtures, the second pins this repository's own workflows, the third pins
+  this file's front matter. All are named in `ci.yml` rather than globbed — a
+  new test file nothing runs is a silent gap.
 - **Add or update tests with any change**, and assert **both directions** of
   every behavior — that a docs diff skips *and* that a code diff does
   not. This suite is the only thing between a push and every consumer's merge
