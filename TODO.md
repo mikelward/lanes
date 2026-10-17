@@ -556,6 +556,12 @@
       not verify, is the settings half: a ruleset on the default branch
       requiring the CI gate, the `codex` status, conversation resolution
       and up-to-date branches, and the auto-merge setting enabled.
+- [ ] **Check `AGENTS.md` < 24,000 bytes in CI** (mikelward/stopdash#932):
+      Antigravity silently truncates a rule file past 24,000 bytes, so the
+      keep-it-short rule needs a test, not just a sentence. Here it belongs
+      in `agents-front-matter.test.mjs` — an assertion that
+      `statSync("AGENTS.md").size < 24000` — since `AGENTS.md` already rides
+      the code lane and that file already runs in `ci.yml`.
 
 ## Policy syntax ergonomics for "markdown docs" (deferred)
 
