@@ -193,8 +193,10 @@ describe("this repository's own lane", () => {
     // which is markdown but not merely prose: workflows.test.mjs reads and
     // asserts on its content, so a docs-only skip on a README edit would
     // let a broken consumer-facing example merge untested (README.md's own
-    // "Writing your policy" section documents exactly this trap).
-    for (const path of ["lanes.mjs", "action.yml", ".github/workflows/ci.yml", "LICENSE", "README.md", "AGENTS.md", POLICY_PATH]) {
+    // "Writing your policy" section documents exactly this trap). AGENTS.md
+    // and its CLAUDE.md / GEMINI.md symlinks are the same trap:
+    // agents-front-matter.test.mjs reads all three.
+    for (const path of ["lanes.mjs", "action.yml", ".github/workflows/ci.yml", "LICENSE", "README.md", "AGENTS.md", "CLAUDE.md", "GEMINI.md", POLICY_PATH]) {
       assert.equal(isDocs(path, policy.rules), false, `${path} rides the code lane`);
     }
     assert.equal(hasPrefix("docs: clarify the README", policy.prefixes), true);
