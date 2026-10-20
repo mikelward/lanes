@@ -126,6 +126,27 @@ describe("this repository's own lane", () => {
     assert.doesNotMatch(workflow, /^name: CI$/m);
   });
 
+  test("one concurrency group per pull request, canceling stale runs but never on main or an edit", () => {
+    // Without a group every push ran twice (the push, and the body edit
+    // beside it) and the older run's lanes failed on the head moving. A
+    // push to main gets a commit-keyed group of its own, so no main run is
+    // canceled; an `edited` run carries the head as of the edit, and GitHub
+    // doesn't promise to start runs in event order, so it queues rather than
+    // cancels. Find the block first, so the pins below can't pass on nothing.
+    const MAIN =
+      "(github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))";
+    const block = workflow.match(/^concurrency:\n((?: {2}.*\n)+)/m);
+    assert.ok(block, "ci.yml has a workflow-level concurrency block");
+    assert.equal(workflow.match(/^concurrency:/gm).length, 1);
+    assert.ok(block[1].includes(
+      `  group: ci-\${{ ${MAIN} && format('main-{0}', github.sha) || github.event.pull_request.number || github.ref }}\n`,
+    ));
+    assert.ok(block[1].includes(
+      `  cancel-in-progress: \${{ !${MAIN} && github.event.action != 'edited' }}\n`,
+    ));
+    assert.match(workflow, /types: \[opened, synchronize, reopened, edited\]/);
+  });
+
   test("classify and the gate run the merged engine; only test runs the branch's copy", () => {
     // In the lane jobs, `uses: $/` (or the workspace-relative `./`) would
     // let a pull request rewrite the engine and be judged by its own
