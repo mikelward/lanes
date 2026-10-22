@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-17
+last_modified: 2026-10-22
 ---
 
 # AGENTS.md
@@ -123,12 +123,15 @@ rewrite or trim rather than append, and delete one that has stopped biting.
   out of scope here, which you defer (below). Judge each on merit: verify the
   claim; if it doesn't hold, reply why and decline. A comment citing a rule is
   a *reading* of it — check what the rule says; an over-strict reading (the
-  privacy rules especially, where stricter feels safer) costs real
-  capability. A genuine rule-vs-need conflict is the maintainer's call, not
-  one to resolve by quietly narrowing the code. Declining doesn't clear the
-  required `codex` status: post the rebuttal, then `@codex review` once (or
-  let the next push, if the rebuttal is up first); escalate if it re-raises,
-  or if that review hasn't landed five minutes on.
+  privacy rules especially, where stricter feels safer) costs real capability.
+  A genuine rule-vs-need conflict is the maintainer's call, not one to resolve
+  by quietly narrowing the code. Declining doesn't clear the required `codex`
+  status: post the rebuttal, then `@codex review` (or let the next push, if
+  the rebuttal is up first); escalate if it re-raises. A hung review — nothing
+  back five minutes after a push or poke, or stuck at running (👀) ten minutes
+  on — gets `@codex review`; a poke that hangs the same way gets a second an
+  hour later, and only a second that hangs too is escalated, never the first
+  (maintainer, 2026-10-22).
 - **Once Codex has +1'd a head, make no unnecessary change without asking**
   (maintainer, 2026-10-13): a to-do, tidy-up or extra fix re-runs CI and Codex
   for nothing, so it waits for a yes or a follow-up PR. A necessary change
@@ -144,12 +147,12 @@ rewrite or trim rather than append, and delete one that has stopped biting.
   all in that one reply; ask only the most blocking question.
 - **Never leave a review thread silently dismissed** — every thread ends in a
   reply or a resolve.
-- **Deferring a finding** (real but out of scope): don't ask to merge past
-  it — note it in `TODO.md`, commit and push that first, reply citing the sha,
-  and resolve. A threadless finding (top-level comment or review body) gets
-  the record, push and reply; only the resolve is skipped. The push re-triggers
-  Codex, so poke only if five minutes pass with nothing back; escalate if the
-  re-review re-raises it, or is still missing five minutes after the poke.
+- **Deferring a finding** (real but out of scope): don't ask to merge past it —
+  note it in `TODO.md`, commit and push that first, reply citing the sha, and
+  resolve. A threadless finding (top-level comment or review body) gets the
+  record, push and reply; only the resolve is skipped. The push re-triggers
+  Codex, so poke only once it hangs, as above; escalate if the re-review
+  re-raises it.
 
 ## Language and spelling
 
