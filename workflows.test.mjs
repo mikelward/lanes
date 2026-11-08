@@ -42,13 +42,17 @@ describe("the codex-review workflow", () => {
     // `synchronize` for it, so the existing `codex: success` would stand over
     // a diff nothing had read.
     assert.match(on, /types: \[opened, reopened, ready_for_review, synchronize, edited, closed\]/);
-    assert.equal(on.match(/types: \[created, edited\]/g)?.length, 2, "both comment events");
     // Both halves of the relay, by name: renaming one without the other
-    // severs it silently, and the review-only verdict goes unheard.
+    // severs it silently, and every verdict the listener hears goes unheard.
     assert.match(on, /workflow_run:\n\s+workflows: \[codex-review-listener\]\n\s+types: \[completed\]/);
     const listener = read("codex-review-listener.yml");
     assert.match(listener, /^name: codex-review-listener$/m);
     assert.match(listener, /pull_request_review:\n\s+types: \[submitted, edited, dismissed\]/);
+    // The comment events live on the listener: they resolve the workflow from
+    // a ref the branch controls, so they must never start the status writer
+    // directly (mikelward/codex-review docs/CONSUMER.md).
+    assert.match(listener, /issue_comment:\n\s+types: \[created, edited\]/);
+    assert.match(listener, /pull_request_review_comment:\n\s+types: \[created, edited\]/);
     assert.match(listener, /^permissions: \{\}$/m);
   });
 
@@ -60,12 +64,16 @@ describe("the codex-review workflow", () => {
     assert.doesNotMatch(on, /workflow_dispatch/);
     assert.doesNotMatch(on, /\bpull_request:/);
     assert.doesNotMatch(on, /\bpull_request_review:/);
+    // The comment events run the file from the pull request branch too --
+    // observed, not assumed -- so they reach the sweep only via the listener.
+    assert.doesNotMatch(on, /\bissue_comment:/);
+    assert.doesNotMatch(on, /\bpull_request_review_comment:/);
   });
 
   test("keeps the backstop schedule four-hourly, off the hour", () => {
     // Four-hourly, not hourly: the events carry the verdict (Codex edits its
     // review summary comment in place as a review starts and finishes, and
-    // that edit is an `issue_comment` this workflow wakes on), so the cron is
+    // that edit is a comment event the listener relays here), so the cron is
     // only the backstop for what no event reports. `:23` rather than `:00`
     // dodges the stampede every scheduler sees on the hour.
     assert.match(workflow, /cron:\s*'23 \*\/4 \* \* \*'/);
@@ -97,7 +105,9 @@ describe("the codex-review workflow", () => {
     const files = readdirSync(dir).filter((n) => /\.ya?ml$/.test(n));
     assert.ok(files.length > 1, "the scan must have something to scan");
     for (const name of files) {
-      const text = read(name);
+      // Comments are prose, not grants: the listener's header names the scope
+      // it must never hold.
+      const text = read(name).replace(/^\s*#.*$/gm, "");
       if (name === "codex-review.yml") assert.match(text, /statuses: write/);
       else assert.doesNotMatch(text, /statuses:\s*write/, `${name} must not hold statuses: write`);
     }
